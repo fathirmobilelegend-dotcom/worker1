@@ -183,6 +183,36 @@ jobs:
           [ -f flutter-project/pubspec.yaml ] || { echo "❌ pubspec tidak ada di root"; exit 1; }
           echo "✅ Project ready: $(du -sh flutter-project)"
 
+      - name: 🐞 Dump ORIGINAL Gradle Files (SEBELUM FIX)
+        if: always()
+        run: |
+          echo "═══════════════════════════════════════════════════"
+          echo "🐞 ORIGINAL GRADLE FILES (ZIP source SEBELUM auto-fix)"
+          echo "═══════════════════════════════════════════════════"
+          for f in \
+            flutter-project/android/settings.gradle \
+            flutter-project/android/settings.gradle.kts \
+            flutter-project/android/build.gradle \
+            flutter-project/android/build.gradle.kts \
+            flutter-project/android/app/build.gradle \
+            flutter-project/android/app/build.gradle.kts \
+            flutter-project/android/gradle.properties \
+            flutter-project/android/gradle/wrapper/gradle-wrapper.properties \
+            flutter-project/android/local.properties
+          do
+            if [ -f "$f" ]; then
+              echo ""
+              echo "───────── FILE: $f ─────────"
+              cat -A "$f" | head -100
+              echo "───────── END: $f ─────────"
+            else
+              echo "   [SKIP] $f (tidak ada)"
+            fi
+          done
+          echo ""
+          echo "───────── Struktur android/ ─────────"
+          find flutter-project/android -maxdepth 3 -type f 2>/dev/null | head -50
+
       - name: 🎯 Setup Flutter ${{ needs.preflight.outputs.flutter_version }}
         uses: subosito/flutter-action@v2
         with:
@@ -194,7 +224,7 @@ jobs:
         run: flutter --version
 
       # ==========================================================
-      # 🧠 MASTER AUTO-FIX STEP (FIXED — AGP/Kotlin only in settings)
+      # 🧠 MASTER AUTO-FIX STEP
       # ==========================================================
       - name: 🧠 Master Auto-Fix & Build
         id: autofix
@@ -206,6 +236,17 @@ jobs:
           echo "🎯 Build mode: $MODE"
 
           log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+          # ==========================================================
+          # 📸 BACKUP original files
+          # ==========================================================
+          mkdir -p /tmp/orig
+          for f in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$f" ]; then
+              mkdir -p "/tmp/orig/$(dirname "$f")"
+              cp "$f" "/tmp/orig/$f"
+            fi
+          done
 
           # ==========================================================
           # 🔧 FIX #1: pubspec.yaml
@@ -228,10 +269,10 @@ jobs:
           }
 
           # ==========================================================
-          # 🔧 FIX #2: Android config
+          # 🔧 FIX #2: Android SDK / keystore / Java
           # ==========================================================
           fix_android_config() {
-            log "🔧 Fix android config (SDK/keystore/Java)..."
+            log "🔧 Fix android SDK/keystore/Java..."
             cd android 2>/dev/null || return 0
             cp ../../release.keystore app/ 2>/dev/null || cp ../release.keystore app/ 2>/dev/null || true
 
@@ -259,38 +300,25 @@ jobs:
               sed -i -E 's/targetCompatibility[[:space:]]*=[[:space:]]*JavaVersion\.VERSION_[0-9_]+/targetCompatibility = JavaVersion.VERSION_17/g' "$f" || true
             done
 
-            # ---------- kotlinOptions (Groovy .gradle) ----------
+            # Groovy: fix jvmTarget (in-place saja, JANGAN inject kalau ada)
             APP="app/build.gradle"
             if [ -f "$APP" ]; then
-              if grep -q "kotlinOptions" "$APP"; then
+              if grep -q "jvmTarget" "$APP"; then
                 perl -i -pe 's/jvmTarget\s*=\s*"[^"]*"/jvmTarget = "17"/g' "$APP"
-              else
-                perl -i -0pe 's/(\bandroid\s*\{)/$1\n    kotlinOptions {\n        jvmTarget = "17"\n    }/' "$APP"
               fi
               O=$(grep -o "{" "$APP" | wc -l); C=$(grep -o "}" "$APP" | wc -l)
-              if [ "$O" != "$C" ]; then
-                log "⚠️ Kurawal tidak balance ($O/$C), restore kotlinOptions"
-                perl -i -0pe 's/kotlinOptions\s*\{[^}]*\}\s*//gs' "$APP" 2>/dev/null || true
-                perl -i -0pe 's/(\bandroid\s*\{)/$1\n    kotlinOptions {\n        jvmTarget = "17"\n    }/' "$APP"
-              fi
+              log "   [Groovy] Kurawal $APP: $O / $C"
             fi
 
-            # ---------- KTS (.kts) — pakai jvmToolchain ----------
+            # KTS: fix jvmTarget dalam block compilerOptions kalau ada
             APP_KTS="app/build.gradle.kts"
             if [ -f "$APP_KTS" ]; then
-              # Hapus kotlinOptions block (format Groovy) dari KTS
-              perl -i -0pe 's/kotlinOptions\s*\{[^}]*\}\s*//gs' "$APP_KTS" 2>/dev/null || true
-
-              if ! grep -q "jvmToolchain" "$APP_KTS"; then
-                if ! grep -qE '^\s*kotlin\s*\{' "$APP_KTS"; then
-                  perl -i -0pe 's/(plugins\s*\{[^}]*\})/$1\n\nkotlin {\n    jvmToolchain(17)\n}/s' "$APP_KTS"
-                fi
+              if grep -q "jvmTarget" "$APP_KTS"; then
+                perl -i -pe 's/jvmTarget\s*=\s*JvmTarget\.JVM_\d+/jvmTarget = JvmTarget.JVM_17/g' "$APP_KTS"
+                perl -i -pe 's/jvmTarget\s*=\s*"[^"]*"/jvmTarget = JvmTarget.JVM_17/g' "$APP_KTS"
               fi
-
               O=$(grep -o "{" "$APP_KTS" | wc -l); C=$(grep -o "}" "$APP_KTS" | wc -l)
-              if [ "$O" != "$C" ]; then
-                log "⚠️ KTS kurawal tidak balance ($O/$C)"
-              fi
+              log "   [KTS] Kurawal $APP_KTS: $O / $C"
             fi
 
             cat > gradle.properties <<'EOF'
@@ -312,7 +340,7 @@ jobs:
           }
 
           # ==========================================================
-          # 🔧 FIX #3: AGP + Kotlin — HANYA settings & root build.gradle
+          # 🔧 FIX #3: AGP + Kotlin versions (settings + root only)
           # ==========================================================
           fix_gradle_agp() {
             local AGP="$1"; local KT="$2"
@@ -334,8 +362,6 @@ jobs:
               sed -i -E "s|org\.jetbrains\.kotlin:kotlin-gradle-plugin:[0-9.]+|org.jetbrains.kotlin:kotlin-gradle-plugin:${KT}|g" "$f" || true
               sed -i -E "s|ext\.kotlin_version[[:space:]]*=[[:space:]]*[\"'][0-9.]+[\"']|ext.kotlin_version = '${KT}'|g" "$f" || true
             done
-
-            # ❌ JANGAN sentuh app/build.gradle untuk version!
           }
 
           # ==========================================================
@@ -373,7 +399,20 @@ jobs:
           }
 
           # ==========================================================
-          # 🚀 MAIN AUTO-FIX LOOP
+          # 🔄 RESTORE dari backup (kalau attempt sebelumnya gagal)
+          # ==========================================================
+          restore_original() {
+            log "🔄 Restore original gradle files..."
+            for f in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts android/app/build.gradle android/app/build.gradle.kts; do
+              if [ -f "/tmp/orig/$f" ]; then
+                cp "/tmp/orig/$f" "$f"
+                log "   ↻ restored $f"
+              fi
+            done
+          }
+
+          # ==========================================================
+          # 🚀 MAIN LOOP
           # ==========================================================
           MAX_ATTEMPTS=4
           SUCCESS=false
@@ -383,6 +422,11 @@ jobs:
           for i in $(seq 0 $((MAX_ATTEMPTS-1))); do
             N=$((i+1))
             log "═══════ ATTEMPT $N / $MAX_ATTEMPTS ═══════"
+
+            # Attempt > 1: restore dari backup dulu
+            if [ "$N" -gt 1 ]; then
+              restore_original
+            fi
 
             fix_pubspec
 
@@ -411,21 +455,19 @@ jobs:
             fix_gradle_wrapper "$AGP"
             log "🎯 Using AGP=$AGP Kotlin=$KT"
 
-            # ---------- PRE-BUILD SANITY CHECK ----------
-            log "🔍 Sanity check app/build.gradle..."
-            APP="android/app/build.gradle"
-            if [ -f "$APP" ]; then
-              if grep -E 'id[[:space:]]*\(?[[:space:]]*["'"'"'](com\.android|org\.jetbrains)' "$APP" | grep -q "version"; then
-                log "⚠️ Ditemukan 'id ... version' di app/build.gradle — hapus!"
-                sed -i -E "/id[[:space:]]*\(?[[:space:]]*[\"']com\.android\.[^\"']*[\"'][^)]*\)?[[:space:]]+version[[:space:]]+[\"'][0-9.]+[\"']/d" "$APP" || true
-                sed -i -E "/id[[:space:]]*\(?[[:space:]]*[\"']org\.jetbrains\.kotlin[^\"']*[\"'][^)]*\)?[[:space:]]+version[[:space:]]+[\"'][0-9.]+[\"']/d" "$APP" || true
-              fi
-              O=$(grep -o "{" "$APP" | wc -l); C=$(grep -o "}" "$APP" | wc -l)
-              log "   Kurawal: $O / $C"
-              if [ "$O" != "$C" ]; then
-                log "❌ Kurawal tidak balance! Log app/build.gradle:"
-                cat "$APP"
-              fi
+            # ==========================================================
+            # 🐞 PRINT file gradle SETELAH FIX (attempt 1 aja biar ga spam)
+            # ==========================================================
+            if [ "$N" -eq 1 ]; then
+              log "────── POST-FIX GRADLE FILES ──────"
+              for f in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts android/app/build.gradle android/app/build.gradle.kts; do
+                if [ -f "$f" ]; then
+                  log "═══ $f ═══"
+                  cat -A "$f" | head -80
+                  log "═══ END $f ═══"
+                fi
+              done
+              log "───────────────────────────────────"
             fi
 
             # ---------- BUILD ----------
@@ -447,25 +489,67 @@ jobs:
             fi
 
             log "❌ Build attempt $N gagal, cleaning & retry..."
-            log "────── Error context ──────"
-            grep -B2 -A5 -iE "error|failed|what went wrong|caused by" build.log | head -40 || true
-            log "───────────────────────────"
+            log "────── Error context (60 baris) ──────"
+            grep -B5 -A10 -iE "error|failed|what went wrong|caused by|script compilation" build.log | head -60 || true
+            log "───────────────────────────────────────"
             flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool
             sleep 3
           done
 
+          # ==========================================================
+          # 🐞 DEBUG DUMP kalau semua attempt gagal
+          # ==========================================================
           if [ "$SUCCESS" != "true" ]; then
             log "❌ SEMUA ATTEMPT GAGAL!"
             echo ""
-            echo "═══════ BUILD LOG (200 baris terakhir) ═══════"
-            tail -200 build.log
-            echo "═══════ END LOG ═══════"
+            echo "══════════════════════════════════════════════════"
+            echo "🐞 FULL DEBUG DUMP"
+            echo "══════════════════════════════════════════════════"
+
             echo ""
-            echo "═══════ APP BUILD.GRADLE ═══════"
-            cat android/app/build.gradle 2>/dev/null || cat android/app/build.gradle.kts 2>/dev/null || echo "(tidak ada)"
-            echo "═══════ SETTINGS.GRADLE ═══════"
-            cat android/settings.gradle 2>/dev/null || cat android/settings.gradle.kts 2>/dev/null || echo "(tidak ada)"
+            echo "═══════ BUILD.LOG (200 baris terakhir) ═══════"
+            tail -200 build.log 2>/dev/null || echo "(tidak ada build.log)"
+
+            echo ""
+            echo "═══════ BUILD.LOG — GREP ERROR DETAIL ═══════"
+            grep -B10 -A30 -iE "error|script compilation|what went wrong" build.log 2>/dev/null | head -300 || true
+
+            echo ""
+            echo "═══════ APP BUILD.GRADLE (setelah fix) ═══════"
+            cat android/app/build.gradle 2>/dev/null || echo "(tidak ada)"
+            cat android/app/build.gradle.kts 2>/dev/null || echo "(tidak ada .kts)"
+
+            echo ""
+            echo "═══════ SETTINGS.GRADLE (setelah fix) ═══════"
+            cat android/settings.gradle 2>/dev/null || echo "(tidak ada)"
+            cat android/settings.gradle.kts 2>/dev/null || echo "(tidak ada .kts)"
+
+            echo ""
+            echo "═══════ ROOT BUILD.GRADLE (setelah fix) ═══════"
+            cat android/build.gradle 2>/dev/null || echo "(tidak ada)"
+            cat android/build.gradle.kts 2>/dev/null || echo "(tidak ada .kts)"
+
+            echo ""
+            echo "═══════ ORIGINAL APP BUILD.GRADLE (dari ZIP) ═══════"
+            cat /tmp/orig/android/app/build.gradle 2>/dev/null || echo "(tidak ada)"
+            cat /tmp/orig/android/app/build.gradle.kts 2>/dev/null || echo "(tidak ada .kts)"
+
+            echo ""
+            echo "═══════ ORIGINAL SETTINGS.GRADLE (dari ZIP) ═══════"
+            cat /tmp/orig/android/settings.gradle 2>/dev/null || echo "(tidak ada)"
+            cat /tmp/orig/android/settings.gradle.kts 2>/dev/null || echo "(tidak ada .kts)"
+
+            echo ""
+            echo "═══════ GRADLE.PROPERTIES ═══════"
+            cat android/gradle.properties 2>/dev/null || echo "(tidak ada)"
+
+            echo ""
+            echo "═══════ STRUKTUR ANDROID/ ═══════"
+            find android -maxdepth 3 -type f 2>/dev/null | head -60
+
+            echo ""
+            echo "═══════ END DEBUG DUMP ═══════"
             exit 1
           fi
 
