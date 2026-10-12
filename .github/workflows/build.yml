@@ -71,7 +71,6 @@ jobs:
             "3.0"*)  FV="3.10.0" ;;
           esac
 
-          # Auto bump dari plugin yang butuh versi tinggi
           NEED_HIGH=false
           for pat in \
             'webview_flutter:[[:space:]]*(\^|>=)?(4\.1[5-9]|[5-9])' \
@@ -195,7 +194,7 @@ jobs:
         run: flutter --version
 
       # ==========================================================
-      # 🧠 MASTER AUTO-FIX STEP (semua fix + retry logic di sini)
+      # 🧠 MASTER AUTO-FIX STEP (FIXED — AGP/Kotlin only in settings)
       # ==========================================================
       - name: 🧠 Master Auto-Fix & Build
         id: autofix
@@ -206,9 +205,11 @@ jobs:
           MODE="${build_type:-release}"
           echo "🎯 Build mode: $MODE"
 
-          # ---------- UTIL ----------
           log() { echo "[$(date +%H:%M:%S)] $*"; }
 
+          # ==========================================================
+          # 🔧 FIX #1: pubspec.yaml
+          # ==========================================================
           fix_pubspec() {
             log "🔧 Fix pubspec.yaml..."
             if grep -qE "requires SDK version|requires Dart SDK" pubget.log 2>/dev/null; then
@@ -226,8 +227,11 @@ jobs:
             rm -f pubspec.lock
           }
 
+          # ==========================================================
+          # 🔧 FIX #2: Android config
+          # ==========================================================
           fix_android_config() {
-            log "🔧 Fix android config..."
+            log "🔧 Fix android config (SDK/keystore/Java)..."
             cd android 2>/dev/null || return 0
             cp ../../release.keystore app/ 2>/dev/null || cp ../release.keystore app/ 2>/dev/null || true
 
@@ -239,6 +243,7 @@ jobs:
               sed -i -E 's/targetSdk[[:space:]]*=[[:space:]]*[0-9]+/targetSdk = 36/g' "$f" || true
               sed -i -E 's/(minSdk(Version)?)[[:space:]]*=?[[:space:]]*[0-9]+/\1 21/g' "$f" || true
               sed -i -E 's/minSdk[[:space:]]*=[[:space:]]*[0-9]+/minSdk = 21/g' "$f" || true
+
               sed -i 's|storeFile file(".*")|storeFile file("release.keystore")|g' "$f" || true
               sed -i 's|storeFile = file(".*")|storeFile = file("release.keystore")|g' "$f" || true
               sed -i 's|storePassword ".*"|storePassword "password"|g' "$f" || true
@@ -247,13 +252,14 @@ jobs:
               sed -i 's|keyAlias = ".*"|keyAlias = "release"|g' "$f" || true
               sed -i 's|keyPassword ".*"|keyPassword "password"|g' "$f" || true
               sed -i 's|keyPassword = ".*"|keyPassword = "password"|g' "$f" || true
+
               sed -i -E 's/sourceCompatibility[[:space:]]+JavaVersion\.VERSION_[0-9_]+/sourceCompatibility JavaVersion.VERSION_17/g' "$f" || true
               sed -i -E 's/targetCompatibility[[:space:]]+JavaVersion\.VERSION_[0-9_]+/targetCompatibility JavaVersion.VERSION_17/g' "$f" || true
               sed -i -E 's/sourceCompatibility[[:space:]]*=[[:space:]]*JavaVersion\.VERSION_[0-9_]+/sourceCompatibility = JavaVersion.VERSION_17/g' "$f" || true
               sed -i -E 's/targetCompatibility[[:space:]]*=[[:space:]]*JavaVersion\.VERSION_[0-9_]+/targetCompatibility = JavaVersion.VERSION_17/g' "$f" || true
             done
 
-            # kotlinOptions (regex aman)
+            # ---------- kotlinOptions (Groovy .gradle) ----------
             APP="app/build.gradle"
             if [ -f "$APP" ]; then
               if grep -q "kotlinOptions" "$APP"; then
@@ -261,7 +267,6 @@ jobs:
               else
                 perl -i -0pe 's/(\bandroid\s*\{)/$1\n    kotlinOptions {\n        jvmTarget = "17"\n    }/' "$APP"
               fi
-              # Validate kurawal
               O=$(grep -o "{" "$APP" | wc -l); C=$(grep -o "}" "$APP" | wc -l)
               if [ "$O" != "$C" ]; then
                 log "⚠️ Kurawal tidak balance ($O/$C), restore kotlinOptions"
@@ -270,7 +275,24 @@ jobs:
               fi
             fi
 
-            # gradle.properties
+            # ---------- KTS (.kts) — pakai jvmToolchain ----------
+            APP_KTS="app/build.gradle.kts"
+            if [ -f "$APP_KTS" ]; then
+              # Hapus kotlinOptions block (format Groovy) dari KTS
+              perl -i -0pe 's/kotlinOptions\s*\{[^}]*\}\s*//gs' "$APP_KTS" 2>/dev/null || true
+
+              if ! grep -q "jvmToolchain" "$APP_KTS"; then
+                if ! grep -qE '^\s*kotlin\s*\{' "$APP_KTS"; then
+                  perl -i -0pe 's/(plugins\s*\{[^}]*\})/$1\n\nkotlin {\n    jvmToolchain(17)\n}/s' "$APP_KTS"
+                fi
+              fi
+
+              O=$(grep -o "{" "$APP_KTS" | wc -l); C=$(grep -o "}" "$APP_KTS" | wc -l)
+              if [ "$O" != "$C" ]; then
+                log "⚠️ KTS kurawal tidak balance ($O/$C)"
+              fi
+            fi
+
             cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m
           org.gradle.parallel=true
@@ -289,23 +311,36 @@ jobs:
             cd ..
           }
 
+          # ==========================================================
+          # 🔧 FIX #3: AGP + Kotlin — HANYA settings & root build.gradle
+          # ==========================================================
           fix_gradle_agp() {
-            log "🔧 Fix AGP + Kotlin versi..."
             local AGP="$1"; local KT="$2"
+            log "🔧 Fix AGP=$AGP Kotlin=$KT (settings + root only)..."
+
             for f in android/settings.gradle android/settings.gradle.kts; do
               [ -f "$f" ] || continue
+              log "   → patch $f"
               sed -i -E "s|(id[[:space:]]*\(?[[:space:]]*[\"']com\.android\.application[\"'][[:space:]]*\)?[[:space:]]+version[[:space:]]+)[\"'][0-9.]+[\"']|\1\"${AGP}\"|g" "$f" || true
               sed -i -E "s|(id[[:space:]]*\(?[[:space:]]*[\"']com\.android\.library[\"'][[:space:]]*\)?[[:space:]]+version[[:space:]]+)[\"'][0-9.]+[\"']|\1\"${AGP}\"|g" "$f" || true
               sed -i -E "s|(id[[:space:]]*\(?[[:space:]]*[\"']org\.jetbrains\.kotlin\.android[\"'][[:space:]]*\)?[[:space:]]+version[[:space:]]+)[\"'][0-9.]+[\"']|\1\"${KT}\"|g" "$f" || true
+              sed -i -E "s|(id[[:space:]]*\(?[[:space:]]*[\"']org\.jetbrains\.kotlin\.jvm[\"'][[:space:]]*\)?[[:space:]]+version[[:space:]]+)[\"'][0-9.]+[\"']|\1\"${KT}\"|g" "$f" || true
             done
+
             for f in android/build.gradle android/build.gradle.kts; do
               [ -f "$f" ] || continue
+              log "   → patch root $f"
               sed -i -E "s|com\.android\.tools\.build:gradle:[0-9.]+|com.android.tools.build:gradle:${AGP}|g" "$f" || true
               sed -i -E "s|org\.jetbrains\.kotlin:kotlin-gradle-plugin:[0-9.]+|org.jetbrains.kotlin:kotlin-gradle-plugin:${KT}|g" "$f" || true
               sed -i -E "s|ext\.kotlin_version[[:space:]]*=[[:space:]]*[\"'][0-9.]+[\"']|ext.kotlin_version = '${KT}'|g" "$f" || true
             done
+
+            # ❌ JANGAN sentuh app/build.gradle untuk version!
           }
 
+          # ==========================================================
+          # 🔧 FIX #4: Gradle wrapper
+          # ==========================================================
           fix_gradle_wrapper() {
             local AGP="$1"
             local MAJOR=$(echo "$AGP" | cut -d. -f1)
@@ -334,12 +369,14 @@ jobs:
           zipStorePath=wrapper/dists
           EOF
             chmod +x android/gradlew 2>/dev/null || true
+            log "   Gradle wrapper → $GRADLE_REQ"
           }
 
-          # ---------- MAIN AUTO-FIX LOOP ----------
+          # ==========================================================
+          # 🚀 MAIN AUTO-FIX LOOP
+          # ==========================================================
           MAX_ATTEMPTS=4
           SUCCESS=false
-          # Tingkatan AGP/Kotlin untuk retry
           AGP_LIST=("8.11.1" "8.9.1" "8.7.0" "8.3.0")
           KT_LIST=("2.2.20" "2.1.0" "2.0.20" "1.9.0")
 
@@ -347,46 +384,48 @@ jobs:
             N=$((i+1))
             log "═══════ ATTEMPT $N / $MAX_ATTEMPTS ═══════"
 
-            # Apply fix #1: pubspec
             fix_pubspec
 
-            # Pub get (retry internal 5x)
-            log "📚 flutter pub get (attempt $N)..."
+            log "📚 flutter pub get..."
             PUB_OK=false
             for j in 1 2 3; do
               if flutter pub get 2>&1 | tee pubget.log; then
                 PUB_OK=true; break
               fi
-              log "  ❌ pub get gagal (retry $j/3), auto-fix..."
+              log "  ❌ pub get gagal (retry $j/3)"
               fix_pubspec
               rm -f pubspec.lock
               sleep 3
             done
-            if [ "$PUB_OK" != "true" ]; then
-              log "⚠️ pub get tetap gagal, lanjut coba build dengan .dart_tool lama (mungkin ada)"
-            fi
 
-            # Auto launch icons
             if grep -q "flutter_launcher_icons:" pubspec.yaml 2>/dev/null; then
               log "🎨 Generate launcher icons..."
               flutter pub run flutter_launcher_icons 2>/dev/null || true
             fi
 
-            # Apply fix #2: android config
             fix_android_config
 
-            # Apply fix #3: AGP/Kotlin bump tiap attempt
             AGP="${AGP_LIST[$i]:-8.7.0}"
             KT="${KT_LIST[$i]:-2.0.20}"
             fix_gradle_agp "$AGP" "$KT"
             fix_gradle_wrapper "$AGP"
-            log "🎯 Pakai AGP=$AGP Kotlin=$KT"
+            log "🎯 Using AGP=$AGP Kotlin=$KT"
 
-            # Apply fix #4: validate kurawal
+            # ---------- PRE-BUILD SANITY CHECK ----------
+            log "🔍 Sanity check app/build.gradle..."
             APP="android/app/build.gradle"
             if [ -f "$APP" ]; then
+              if grep -E 'id[[:space:]]*\(?[[:space:]]*["'"'"'](com\.android|org\.jetbrains)' "$APP" | grep -q "version"; then
+                log "⚠️ Ditemukan 'id ... version' di app/build.gradle — hapus!"
+                sed -i -E "/id[[:space:]]*\(?[[:space:]]*[\"']com\.android\.[^\"']*[\"'][^)]*\)?[[:space:]]+version[[:space:]]+[\"'][0-9.]+[\"']/d" "$APP" || true
+                sed -i -E "/id[[:space:]]*\(?[[:space:]]*[\"']org\.jetbrains\.kotlin[^\"']*[\"'][^)]*\)?[[:space:]]+version[[:space:]]+[\"'][0-9.]+[\"']/d" "$APP" || true
+              fi
               O=$(grep -o "{" "$APP" | wc -l); C=$(grep -o "}" "$APP" | wc -l)
-              log "  Kurawal app/build.gradle: $O / $C"
+              log "   Kurawal: $O / $C"
+              if [ "$O" != "$C" ]; then
+                log "❌ Kurawal tidak balance! Log app/build.gradle:"
+                cat "$APP"
+              fi
             fi
 
             # ---------- BUILD ----------
@@ -399,7 +438,6 @@ jobs:
               flutter build apk --debug 2>&1 | tee build.log
             fi
 
-            # Cek hasil
             if [ -f "build/app/outputs/flutter-apk/app-${MODE}.apk" ] || \
                [ -f "build/app/outputs/flutter-apk/app-release.apk" ] || \
                [ -f "build/app/outputs/flutter-apk/app-debug.apk" ]; then
@@ -409,6 +447,9 @@ jobs:
             fi
 
             log "❌ Build attempt $N gagal, cleaning & retry..."
+            log "────── Error context ──────"
+            grep -B2 -A5 -iE "error|failed|what went wrong|caused by" build.log | head -40 || true
+            log "───────────────────────────"
             flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool
             sleep 3
@@ -417,9 +458,14 @@ jobs:
           if [ "$SUCCESS" != "true" ]; then
             log "❌ SEMUA ATTEMPT GAGAL!"
             echo ""
-            echo "═══════ BUILD LOG (100 baris terakhir) ═══════"
-            tail -100 build.log
+            echo "═══════ BUILD LOG (200 baris terakhir) ═══════"
+            tail -200 build.log
             echo "═══════ END LOG ═══════"
+            echo ""
+            echo "═══════ APP BUILD.GRADLE ═══════"
+            cat android/app/build.gradle 2>/dev/null || cat android/app/build.gradle.kts 2>/dev/null || echo "(tidak ada)"
+            echo "═══════ SETTINGS.GRADLE ═══════"
+            cat android/settings.gradle 2>/dev/null || cat android/settings.gradle.kts 2>/dev/null || echo "(tidak ada)"
             exit 1
           fi
 
