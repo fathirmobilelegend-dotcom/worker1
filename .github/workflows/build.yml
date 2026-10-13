@@ -1,4 +1,4 @@
-name: Build APK (Mega Auto-Fix v5.0)
+name: Build APK (Mega Auto-Fix)
 
 on:
   push:
@@ -37,11 +37,10 @@ jobs:
           echo "project_type=$PT" >> $GITHUB_OUTPUT
           echo "Type: $PT | Mode: $BT"
 
-      - name: Install Tools
+      - name: Install Basic Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full unzip bsdtar python3 jq 2>/dev/null || \
-          sudo apt-get install -y -qq p7zip-full unzip python3 jq
+          sudo apt-get install -y -qq p7zip-full unzip jq python3 2>/dev/null || true
 
       - name: Detect Flutter Version
         id: detect
@@ -88,14 +87,21 @@ jobs:
       - name: Install Android SDK
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          for pkg in "platforms;android-33" "platforms;android-34" "platforms;android-35" "platforms;android-36" "build-tools;33.0.2" "build-tools;34.0.0" "build-tools;35.0.0" "build-tools;36.0.0" "platform-tools" "cmdline-tools;latest"; do
-            sdkmanager "$pkg" > /dev/null 2>&1 || true
-          done
+          sdkmanager "platforms;android-33" > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;33.0.2" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;34.0.0" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;35.0.0" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;36.0.0" > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" > /dev/null 2>&1 || true
+          sdkmanager "cmdline-tools;latest" > /dev/null 2>&1 || true
 
       - name: Install Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq imagemagick jq unzip curl file zip p7zip-full python3
+          sudo apt-get install -y -qq imagemagick jq unzip curl file zip p7zip-full python3 rsync
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -109,39 +115,6 @@ jobs:
       - name: Generate Keystore
         run: |
           keytool -genkeypair -v -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass password -keypass password -dname "CN=BuildBot, OU=Dev, O=BuildBot, L=City, S=State, C=ID"
-
-      # ====================================================================
-      # 🔥 INIT.GRADLE — FORCE jvmTarget 17 DI SEMUA SUBPROJECT
-      #    Ini fix utama untuk "Kotlin Compilation error"
-      # ====================================================================
-      - name: Create Gradle Init Script
-        run: |
-          mkdir -p ~/.gradle
-          printf '%s\n' \
-            'allprojects {' \
-            '    tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {' \
-            '        kotlinOptions {' \
-            '            jvmTarget = "17"' \
-            '            freeCompilerArgs += ["-Xjvm-default=all"]' \
-            '            suppressWarnings = true' \
-            '        }' \
-            '    }' \
-            '    afterEvaluate {' \
-            '        if (plugins.hasPlugin("com.android.application") || plugins.hasPlugin("com.android.library")) {' \
-            '            try {' \
-            '                android {' \
-            '                    compileOptions {' \
-            '                        sourceCompatibility JavaVersion.VERSION_17' \
-            '                        targetCompatibility JavaVersion.VERSION_17' \
-            '                    }' \
-            '                }' \
-            '            } catch (Exception e) { }' \
-            '        }' \
-            '    }' \
-            '}' \
-            > ~/.gradle/init.gradle
-          echo "=== init.gradle ==="
-          cat ~/.gradle/init.gradle
 
       - name: Extract Project
         shell: bash
@@ -157,7 +130,7 @@ jobs:
           elif python3 -c "import zipfile; zipfile.ZipFile('project.zip').extractall('/tmp/ext')" 2>&1; then
             echo "OK python"
           else
-            echo "Semua metode gagal, coba unzip"
+            echo "Fallback unzip"
             unzip -o -q project.zip -d /tmp/ext 2>&1 || true
           fi
 
@@ -195,63 +168,105 @@ jobs:
         if: needs.preflight.outputs.project_type == 'flutter'
         run: flutter --version
 
-      # ====================================================================
-      # DEEP FIX — SCAN SEMUA build.gradle DAN PATCH
-      # ====================================================================
-      - name: Deep Fix All Gradle Files
+      # ============================================================
+      # FIX 1: Syntax KTS + Groovy
+      # ============================================================
+      - name: Fix Syntax KTS
         shell: bash
         run: |
           cd project
-          echo "=== SCAN semua build.gradle ==="
-          find . -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) -not -path "*/build/*" | while read f; do
-            echo "--- Fix: $f ---"
-
-            # ============ KOTLIN DSL ============
-            perl -i -pe 's/\bcompileSdkVersion\s*=?\s*\d+/compileSdk = 36/g' "$f" 2>/dev/null
-            perl -i -pe 's/\bcompileSdk\s*=?\s*\d+/compileSdk = 36/g' "$f" 2>/dev/null
-            perl -i -pe 's/\bminSdkVersion\s*=?\s*\d+/minSdk = 21/g' "$f" 2>/dev/null
-            perl -i -pe 's/\bminSdk\s*=?\s*\d+/minSdk = 21/g' "$f" 2>/dev/null
-            perl -i -pe 's/\btargetSdkVersion\s*=?\s*\d+/targetSdk = 36/g' "$f" 2>/dev/null
-            perl -i -pe 's/\btargetSdk\s*=?\s*\d+/targetSdk = 36/g' "$f" 2>/dev/null
-
-            # jvmTarget — 4 varian
-            perl -i -pe 's/jvmTarget\s*=\s*JavaVersion\.VERSION_\d+\.toString\(\)/jvmTarget = "17"/g' "$f" 2>/dev/null
-            perl -i -pe 's/jvmTarget\s*=\s*JvmTarget\.JVM_\d+/jvmTarget = "17"/g' "$f" 2>/dev/null
-            perl -i -pe 's/jvmTarget\s*=\s*"[^"]*"/jvmTarget = "17"/g' "$f" 2>/dev/null
-            perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f" 2>/dev/null
-
-            # Java compatibility
-            perl -i -pe 's/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility = JavaVersion.VERSION_17/g' "$f" 2>/dev/null
-            perl -i -pe 's/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility = JavaVersion.VERSION_17/g' "$f" 2>/dev/null
-
-            # Kotlin jvmToolchain
-            perl -i -pe 's/jvmToolchain\(\s*\d+\s*\)/jvmToolchain(17)/g' "$f" 2>/dev/null
-
-            # namespace + applicationId
-            perl -i -pe 's/^(\s*)namespace\s+"([^"]+)"/\1namespace = "\2"/g' "$f" 2>/dev/null
+          find . -type f -name "*.gradle.kts" 2>/dev/null | while read f; do
+            perl -i -pe "s/\bcompileSdkVersion\s*=?\s*\d+/compileSdk = 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/\bcompileSdk\s*=?\s*\d+/compileSdk = 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/\bminSdkVersion\s*=?\s*\d+/minSdk = 21/g" "$f" 2>/dev/null
+            perl -i -pe "s/\bminSdk\s*=?\s*\d+/minSdk = 21/g" "$f" 2>/dev/null
+            perl -i -pe "s/\btargetSdkVersion\s*=?\s*\d+/targetSdk = 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/\btargetSdk\s*=?\s*\d+/targetSdk = 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/^(\s*)namespace\s+\"([^\"]+)\"/\1namespace = \"\2\"/g" "$f" 2>/dev/null
             perl -i -pe "s/^(\s*)namespace\s+'([^']+)'/\1namespace = \"\2\"/g" "$f" 2>/dev/null
-            perl -i -pe 's/^(\s*)applicationId\s+"([^"]+)"/\1applicationId = "\2"/g' "$f" 2>/dev/null
+            perl -i -pe "s/^(\s*)applicationId\s+\"([^\"]+)\"/\1applicationId = \"\2\"/g" "$f" 2>/dev/null
             perl -i -pe "s/^(\s*)applicationId\s+'([^']+)'/\1applicationId = \"\2\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/^(\s*)ndkVersion\s+\"([^\"]+)\"/\1ndkVersion = \"\2\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/^(\s*)versionCode\s+([^\s=\n]+)/\1versionCode = \2/g" "$f" 2>/dev/null
+            perl -i -pe "s/^(\s*)versionName\s+([^\s=\n]+)/\1versionName = \2/g" "$f" 2>/dev/null
+            perl -i -pe "s/signingConfig\s+signingConfigs\./signingConfig = signingConfigs./g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*JavaVersion\.VERSION_\d+\.toString\(\)/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*JvmTarget\.JVM_\d+/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*\"[^\"]*\"/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+          done
+          echo "KTS done"
+
+      - name: Fix Syntax Groovy
+        shell: bash
+        run: |
+          cd project
+          find . -type f -name "*.gradle" 2>/dev/null | while read f; do
+            perl -i -pe "s/\bcompileSdkVersion\s*=?\s*\d+/compileSdkVersion 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/\bcompileSdk\s*=?\s*\d+/compileSdk 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/\bminSdkVersion\s*=?\s*\d+/minSdkVersion 21/g" "$f" 2>/dev/null
+            perl -i -pe "s/\bminSdk\s*=?\s*\d+/minSdk 21/g" "$f" 2>/dev/null
+            perl -i -pe "s/\btargetSdkVersion\s*=?\s*\d+/targetSdkVersion 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/\btargetSdk\s*=?\s*\d+/targetSdk 36/g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*\"[^\"]*\"/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+          done
+          echo "Groovy done"
+
+      # ============================================================
+      # FIX 2: Kotlin compiler options (FIX UTAMA)
+      # ============================================================
+      - name: Fix Kotlin Options
+        shell: bash
+        run: |
+          cd project
+          echo "=== Adding Kotlin compiler skip options ==="
+
+          # Cari semua build.gradle / build.gradle.kts di root & app
+          for f in build.gradle build.gradle.kts app/build.gradle app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+
+            # Kalau .kts
+            if [[ "$f" == *.kts ]]; then
+              if ! grep -q "freeCompilerArgs" "$f"; then
+                # Inject kotlinOptions block di android{} kalau belum ada
+                if ! grep -q "kotlinOptions" "$f"; then
+                  perl -i -0pe 's/(\bandroid\s*\{)/$1\n    kotlinOptions {\n        jvmTarget = "17"\n        freeCompilerArgs += listOf("-Xskip-metadata-version-check", "-Xskip-prerelease-check")\n    }/' "$f" 2>/dev/null || true
+                else
+                  # kotlinOptions sudah ada, tambahkan freeCompilerArgs
+                  perl -i -0pe 's/(kotlinOptions\s*\{)/$1\n        freeCompilerArgs += listOf("-Xskip-metadata-version-check", "-Xskip-prerelease-check")/' "$f" 2>/dev/null || true
+                fi
+              fi
+            else
+              # Groovy
+              if ! grep -q "freeCompilerArgs" "$f"; then
+                if ! grep -q "kotlinOptions" "$f"; then
+                  perl -i -0pe 's/(\bandroid\s*\{)/$1\n    kotlinOptions {\n        jvmTarget = "17"\n        freeCompilerArgs += ["-Xskip-metadata-version-check", "-Xskip-prerelease-check"]\n    }/' "$f" 2>/dev/null || true
+                else
+                  perl -i -0pe 's/(kotlinOptions\s*\{)/$1\n        freeCompilerArgs += ["-Xskip-metadata-version-check", "-Xskip-prerelease-check"]/' "$f" 2>/dev/null || true
+                fi
+              fi
+            fi
           done
 
-          echo "=== END DEEP FIX ==="
-          echo ""
+          echo "=== Kotlin options added ==="
+          for f in build.gradle build.gradle.kts app/build.gradle app/build.gradle.kts; do
+            [ -f "$f" ] && { echo "--- $f ---"; head -40 "$f"; echo "---"; }
+          done
 
-          # Show app/build.gradle
-          if [ -f "app/build.gradle" ]; then
-            echo "=== app/build.gradle ==="
-            head -60 app/build.gradle
-          elif [ -f "app/build.gradle.kts" ]; then
-            echo "=== app/build.gradle.kts ==="
-            head -60 app/build.gradle.kts
-          fi
-
+      # ============================================================
+      # FIX 3: Android config (Flutter only)
+      # ============================================================
       - name: Fix Android Config (Flutter)
         if: needs.preflight.outputs.project_type == 'flutter'
         shell: bash
         run: |
           cd project
-          if [ ! -d "android" ]; then echo "no android dir"; exit 0; fi
+          if [ ! -d "android" ]; then echo "no android dir, skip"; exit 0; fi
 
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ] && ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
@@ -280,7 +295,7 @@ jobs:
             fi
           fi
 
-          printf '%s\n' 'org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m' 'org.gradle.parallel=true' 'org.gradle.caching=true' 'org.gradle.configureondemand=true' 'org.gradle.daemon=false' 'android.useAndroidX=true' 'android.enableJetifier=true' 'android.nonTransitiveRClass=false' 'android.nonFinalResIds=false' 'android.suppressUnsupportedCompileSdk=36' 'kotlin.daemon.jvmargs=-Xmx2048m' 'kotlin.jvm.target.validation.mode=ignore' 'kotlin.compiler.execution.strategy=in-process' > android/gradle.properties
+          printf '%s\n' 'org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m' 'org.gradle.parallel=true' 'org.gradle.caching=true' 'org.gradle.configureondemand=true' 'org.gradle.daemon=false' 'android.useAndroidX=true' 'android.enableJetifier=true' 'android.nonTransitiveRClass=false' 'android.nonFinalResIds=false' 'android.suppressUnsupportedCompileSdk=36' 'kotlin.daemon.jvmargs=-Xmx2048m' 'kotlin.jvm.target.validation.mode=warning' 'kotlin.compiler.execution.strategy=in-process' > android/gradle.properties
 
           FLUTTER_ROOT_DIR=$(dirname "$(dirname "$(which flutter 2>/dev/null || echo /opt/flutter)")")
           printf '%s\n' "flutter.sdk=$FLUTTER_ROOT_DIR" "sdk.dir=$ANDROID_HOME" > android/local.properties
@@ -288,34 +303,19 @@ jobs:
           if [ -f "../release.keystore" ]; then
             cp ../release.keystore android/app/ 2>/dev/null || true
           fi
-        echo "Android config fixed"
 
-      # ====================================================================
-      # FIX GRADLE PROPERTIES (untuk non-flutter)
-      # ====================================================================
-      - name: Fix Gradle Properties
-        shell: bash
-        run: |
-          cd project
-          if [ "${{ needs.preflight.outputs.project_type }}" = "gradle" ]; then
-            printf '%s\n' \
-              'org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m' \
-              'org.gradle.parallel=true' \
-              'org.gradle.caching=true' \
-              'org.gradle.daemon=false' \
-              'android.useAndroidX=true' \
-              'android.enableJetifier=true' \
-              'android.suppressUnsupportedCompileSdk=36' \
-              'kotlin.daemon.jvmargs=-Xmx2048m' \
-              'kotlin.jvm.target.validation.mode=ignore' \
-              'kotlin.compiler.execution.strategy=in-process' \
-              > gradle.properties
-            echo "gradle.properties updated"
-          fi
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            perl -i -pe 's/storeFile\s*=?\s*file\(".*"\)/storeFile = file("release.keystore")/g' "$f" 2>/dev/null
+            perl -i -pe 's/storePassword\s*=?\s*".*"/storePassword = "password"/g' "$f" 2>/dev/null
+            perl -i -pe 's/keyAlias\s*=?\s*".*"/keyAlias = "release"/g' "$f" 2>/dev/null
+            perl -i -pe 's/keyPassword\s*=?\s*".*"/keyPassword = "password"/g' "$f" 2>/dev/null
+          done
+          echo "Android config fixed"
 
-      # ====================================================================
-      # BUILD LOOP — 5 attempts
-      # ====================================================================
+      # ============================================================
+      # BUILD LOOP (4 attempt)
+      # ============================================================
       - name: Build
         shell: bash
         run: |
@@ -326,10 +326,10 @@ jobs:
 
           if [ "$PTYPE" = "gradle" ] && [ -f gradlew ]; then chmod +x gradlew; fi
 
-          MAX=5
+          MAX=4
           SUCCESS=false
-          AGP_LIST=("8.11.1" "8.9.1" "8.7.0" "8.3.0" "8.7.0")
-          KT_LIST=("2.2.20" "2.1.0" "2.0.20" "1.9.0" "2.0.20")
+          AGP_LIST=("8.11.1" "8.9.1" "8.7.0" "8.3.0")
+          KT_LIST=("2.2.20" "2.1.0" "2.0.20" "1.9.0")
 
           for N in $(seq 1 $MAX); do
             i=$((N-1))
@@ -378,9 +378,9 @@ jobs:
             if [ "$PTYPE" = "flutter" ]; then
               flutter pub get 2>&1 | tail -3
               if [ "$MODE" = "release" ]; then
-                flutter build apk --release --no-tree-shake-icons 2>&1 | tail -80
+                flutter build apk --release --no-tree-shake-icons 2>&1 | tee build.log | tail -80
               else
-                flutter build apk --debug 2>&1 | tail -80
+                flutter build apk --debug 2>&1 | tee build.log | tail -80
               fi
               if [ -f "build/app/outputs/flutter-apk/app-${MODE}.apk" ] || [ -f "build/app/outputs/flutter-apk/app-release.apk" ] || [ -f "build/app/outputs/flutter-apk/app-debug.apk" ]; then
                 echo "SUCCESS attempt $N"; SUCCESS=true; break
@@ -389,9 +389,9 @@ jobs:
               TASK="assembleRelease"
               [ "$MODE" = "debug" ] && TASK="assembleDebug"
               if [ -f gradlew ]; then
-                ./gradlew "$TASK" --no-daemon --console=plain --stacktrace --warning-mode=none 2>&1 | tail -100
+                ./gradlew "$TASK" --no-daemon --console=plain --stacktrace --warning-mode all 2>&1 | tee build.log | tail -100
               else
-                gradle "$TASK" --no-daemon --console=plain 2>&1 | tail -100 || gradle wrapper 2>&1 | tail -5
+                gradle "$TASK" --no-daemon --console=plain 2>&1 | tee build.log | tail -100 || gradle wrapper 2>&1 | tail -5
               fi
               APK=$(find . -name "*.apk" -path "*outputs/apk*" 2>/dev/null | head -n1)
               if [ -n "$APK" ]; then
@@ -403,18 +403,36 @@ jobs:
             fi
 
             echo "Attempt $N failed"
+
+            # === KOTLIN ERROR EXTRACT (FITUR BARU) ===
+            echo ""
+            echo "=== Kotlin Compilation Errors (if any) ==="
+            grep -E "^e: file:" build.log | head -30 || true
+            echo "=== End Kotlin Errors ==="
+
+            # Show more context
+            echo ""
+            echo "=== Last 50 lines of build.log ==="
+            tail -50 build.log || true
+            echo "=== End ==="
+
             flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool 2>/dev/null || true
             sleep 2
           done
 
           if [ "$SUCCESS" != "true" ]; then
-            echo "ALL FAILED"
             echo ""
-            echo "=== LAST 30 ERROR LINES (dari build log terakhir) ==="
-            ls -la 2>/dev/null
+            echo "==================================================="
+            echo "ALL FAILED — FULL BUILD LOG"
+            echo "==================================================="
+            tail -200 build.log || true
+            echo "==================================================="
+            echo "=== Kotlin Errors Detail ==="
+            grep -E "^e: file:" build.log || true
+            echo "==================================================="
             for f in android/app/build.gradle.kts android/app/build.gradle build.gradle.kts build.gradle; do
-              [ -f "$f" ] && { echo "=== $f ==="; head -50 "$f"; echo "=== END ==="; }
+              [ -f "$f" ] && { echo "=== $f ==="; head -60 "$f"; echo "=== END ==="; }
             done
             exit 1
           fi
@@ -437,7 +455,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p output
-          if [ "${{ needs.preflight.outputs.project_type }}" == "flutter" ]; then
+          if [ "${{ needs.preflight.outputs.project_type }}" = "flutter" ]; then
             APK=$(find project/build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -n1)
           else
             APK=$(find /tmp/out -name "*.apk" 2>/dev/null | head -n1)
