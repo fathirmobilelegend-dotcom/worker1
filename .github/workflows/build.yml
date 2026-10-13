@@ -5,7 +5,8 @@ on:
     branches:
       - build
     paths:
-      - 'project.zip'
+      - 'zip-chunks/**'
+      - 'zip-info.json'
       - 'build-config.json'
 
 env:
@@ -24,6 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq unzip jq p7zip-full python3 2>/dev/null || true
+
       - name: Read Config
         id: cfg
         run: |
@@ -37,18 +43,23 @@ jobs:
           echo "project_type=$PT" >> $GITHUB_OUTPUT
           echo "Type: $PT | Mode: $BT"
 
-      - name: Install Tools
+      - name: Reassemble ZIP for Detection
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full unzip bsdtar python3 jq 2>/dev/null || \
-          sudo apt-get install -y -qq p7zip-full unzip python3 jq
+          rm -f /tmp/project.zip
+          TOTAL=$(jq -r .totalChunks zip-info.json)
+          echo "Reassembling $TOTAL chunks..."
+          for (( i=0; i<TOTAL; i++ )); do
+            PADDED=$(printf "%04d" $i)
+            cat "zip-chunks/chunk-${PADDED}.bin" >> /tmp/project.zip
+          done
+          ls -la /tmp/project.zip
 
       - name: Detect Flutter Version
         id: detect
         run: |
           rm -rf /tmp/fc
           mkdir -p /tmp/fc
-          7z x project.zip -o/tmp/fc -y > /dev/null 2>&1 || unzip -o -q project.zip -d /tmp/fc 2>/dev/null || true
+          7z x /tmp/project.zip -o/tmp/fc -y > /dev/null 2>&1 || unzip -o -q /tmp/project.zip -d /tmp/fc 2>/dev/null || true
           PUB=$(find /tmp/fc -maxdepth 4 -name pubspec.yaml -not -path '*/.*' | head -n1)
           if [ -z "$PUB" ]; then
             echo "flutter_version=3.35.2" >> $GITHUB_OUTPUT
@@ -117,22 +128,31 @@ jobs:
         run: |
           keytool -genkeypair -v -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass password -keypass password -dname "CN=BuildBot, OU=Dev, O=BuildBot, L=City, S=State, C=ID"
 
-      - name: Extract Project
+      - name: Reassemble & Extract Project
         shell: bash
         run: |
+          rm -f /tmp/project.zip /tmp/ext
           rm -rf project /tmp/ext
           mkdir -p project /tmp/ext
 
+          echo "=== Reassembling chunks ==="
+          TOTAL=$(jq -r .totalChunks zip-info.json)
+          echo "Total chunks: $TOTAL"
+          for (( i=0; i<TOTAL; i++ )); do
+            PADDED=$(printf "%04d" $i)
+            cat "zip-chunks/chunk-${PADDED}.bin" >> /tmp/project.zip
+          done
+          echo "ZIP size: $(du -h /tmp/project.zip)"
+
           echo "=== Extract pakai 7z (primary) ==="
-          if 7z x project.zip -o/tmp/ext -y -bso0 -bsp0 2>&1; then
+          if 7z x /tmp/project.zip -o/tmp/ext -y -bso0 -bsp0 2>&1; then
             echo "OK 7z"
-          elif bsdtar -xf project.zip -C /tmp/ext 2>&1; then
+          elif bsdtar -xf /tmp/project.zip -C /tmp/ext 2>&1; then
             echo "OK bsdtar"
-          elif python3 -c "import zipfile; zipfile.ZipFile('project.zip').extractall('/tmp/ext')" 2>&1; then
+          elif python3 -c "import zipfile; zipfile.ZipFile('/tmp/project.zip').extractall('/tmp/ext')" 2>&1; then
             echo "OK python"
           else
-            echo "Semua metode gagal, coba unzip"
-            unzip -o -q project.zip -d /tmp/ext 2>&1 || true
+            unzip -o -q /tmp/project.zip -d /tmp/ext 2>&1 || true
           fi
 
           if [ "${{ needs.preflight.outputs.project_type }}" = "flutter" ]; then
@@ -348,7 +368,6 @@ jobs:
             done
 
             echo "AGP=$AGP Kotlin=$KT Gradle=$GR"
-
             rm -rf build .dart_tool/package_config.json 2>/dev/null || true
 
             if [ "$PTYPE" = "flutter" ]; then
