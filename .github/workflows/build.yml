@@ -168,7 +168,33 @@ jobs:
         run: flutter --version
 
       # ==========================================================
-      # 🧠 AUTO-FIX + GRADLEW DIRECT + FULL ERROR SHOW
+      # 🔍 DIAGNOSTIC #1: Dump original gradle files SEBELUM fix
+      # ==========================================================
+      - name: 🔍 Dump Original Gradle Files
+        run: |
+          echo "═══════════════════════════════════════════════════"
+          echo "🔍 ORIGINAL GRADLE FILES (dari ZIP)"
+          echo "═══════════════════════════════════════════════════"
+          for f in \
+            flutter-project/android/settings.gradle \
+            flutter-project/android/settings.gradle.kts \
+            flutter-project/android/build.gradle \
+            flutter-project/android/build.gradle.kts \
+            flutter-project/android/app/build.gradle \
+            flutter-project/android/app/build.gradle.kts \
+            flutter-project/android/gradle.properties \
+            flutter-project/android/gradle/wrapper/gradle-wrapper.properties
+          do
+            if [ -f "$f" ]; then
+              echo ""
+              echo "════════ $f ════════"
+              cat -n "$f"
+              echo "════════ END $f ════════"
+            fi
+          done
+
+      # ==========================================================
+      # 🧠 AUTO-FIX + BUILD
       # ==========================================================
       - name: 🧠 Auto-Fix & Build
         id: autofix
@@ -177,15 +203,11 @@ jobs:
           set +e
           cd flutter-project
           MODE="${build_type:-release}"
-          echo "🎯 Build mode: $MODE"
-
           log() { echo "[$(date +%H:%M:%S)] $*"; }
 
-          mkdir -p /tmp/orig
-          for f in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts android/app/build.gradle android/app/build.gradle.kts; do
-            [ -f "$f" ] && { mkdir -p "/tmp/orig/$(dirname "$f")"; cp "$f" "/tmp/orig/$f"; }
-          done
-
+          # ==========================================================
+          # 🔧 FIX functions
+          # ==========================================================
           fix_pubspec() {
             log "🔧 Fix pubspec..."
             sed -i -E "s|sdk:[[:space:]]*['\"]?[>=^~ ]*3\.[0-9.]+[^'\"]*['\"]?|sdk: '>=3.6.0 <4.0.0'|g" pubspec.yaml || true
@@ -231,7 +253,6 @@ jobs:
           org.gradle.caching=true
           org.gradle.configureondemand=true
           org.gradle.daemon=false
-          org.gradle.logging.level=info
           android.useAndroidX=true
           android.enableJetifier=true
           android.nonTransitiveRClass=false
@@ -289,50 +310,22 @@ jobs:
             chmod +x android/gradlew 2>/dev/null || true
           }
 
-          regenerate_android() {
-            log "🔥 REGENERATE android/ folder dari nol..."
-            PROJECT_NAME=$(grep -E '^name:' pubspec.yaml | head -n1 | sed 's/name:[[:space:]]*//; s/[[:space:]]*$//' || echo "myapp")
-            log "   Project name: $PROJECT_NAME"
-            mv android android.bak 2>/dev/null || true
-            flutter create --platforms=android --project-name "$PROJECT_NAME" --org com.example . 2>&1 | tee /tmp/fc.log || true
-            if [ ! -f "android/app/build.gradle" ] && [ ! -f "android/app/build.gradle.kts" ]; then
-              log "❌ flutter create gagal, restore"
-              cat /tmp/fc.log | tail -20
-              rm -rf android
-              mv android.bak android 2>/dev/null || true
-              return 1
-            fi
-            log "   ✅ Regenerated"
-            cp release.keystore android/app/ 2>/dev/null || true
-            return 0
-          }
-
           # ==========================================================
           # 🚀 MAIN LOOP
           # ==========================================================
-          MAX_ATTEMPTS=5
+          MAX_ATTEMPTS=3
           SUCCESS=false
-          AGP_LIST=("8.11.1" "8.11.1" "8.7.0" "8.3.0" "8.7.0")
-          KT_LIST=("2.2.20" "2.2.20" "2.0.20" "1.9.0" "2.0.20")
+          AGP_LIST=("8.11.1" "8.9.1" "8.7.0")
+          KT_LIST=("2.2.20" "2.1.0" "2.0.20")
 
           for i in $(seq 0 $((MAX_ATTEMPTS-1))); do
             N=$((i+1))
             log "═══════ ATTEMPT $N / $MAX_ATTEMPTS ═══════"
 
-            if [ "$N" -eq 4 ]; then
-              regenerate_android || log "⚠️ regen gagal, lanjut biasa"
-            fi
-
             fix_pubspec
 
             log "📚 flutter pub get..."
-            for j in 1 2 3; do
-              flutter pub get 2>&1 | tee pubget.log && break
-              log "  ❌ retry pub get $j/3"
-              fix_pubspec
-              rm -f pubspec.lock
-              sleep 2
-            done
+            flutter pub get 2>&1 | tail -5
 
             fix_android_config
 
@@ -342,45 +335,18 @@ jobs:
             fix_gradle_wrapper "$AGP"
             log "🎯 Using AGP=$AGP Kotlin=$KT"
 
-            # Print settings & app gradle
-            log "─── SETTINGS ───"
-            cat android/settings.gradle 2>/dev/null || cat android/settings.gradle.kts 2>/dev/null
-            log "─── APP BUILD.GRADLE ───"
-            cat android/app/build.gradle 2>/dev/null || cat android/app/build.gradle.kts 2>/dev/null
-
             # ==========================================================
-            # 🔨 BUILD via ./gradlew DIRECT (bikin error keliatan)
+            # 🔨 BUILD
             # ==========================================================
-            log "🔨 gradlew assembleRelease (attempt $N)..."
+            log "🔨 flutter build apk --$MODE (attempt $N)..."
             rm -rf build .dart_tool/package_config.json 2>/dev/null || true
 
-            GRADLE_TASK="assembleRelease"
-            [ "$MODE" = "debug" ] && GRADLE_TASK="assembleDebug"
+            if [ "$MODE" = "release" ]; then
+              flutter build apk --release --no-tree-shake-icons 2>&1 | tee build.log
+            else
+              flutter build apk --debug 2>&1 | tee build.log
+            fi
 
-            cd android
-            FLUTTER_ROOT_DIR=$(dirname "$(dirname "$(which flutter)")")
-            {
-              echo "flutter.sdk=$FLUTTER_ROOT_DIR"
-              echo "sdk.dir=$ANDROID_HOME"
-            } > local.properties
-
-            # INI KUNCI: pakai gradlew direct, jangan flutter build
-            ./gradlew "$GRADLE_TASK" \
-              --stacktrace \
-              --no-daemon \
-              --console=plain \
-              --warning-mode all \
-              --info \
-              > ../gradle.log 2>&1
-
-            GRADLE_EXIT=$?
-
-            # Tail ke stdout — 500 baris terakhir
-            tail -500 ../gradle.log
-
-            cd ..
-
-            # Cek hasil
             if [ -f "build/app/outputs/flutter-apk/app-${MODE}.apk" ] || \
                [ -f "build/app/outputs/flutter-apk/app-release.apk" ] || \
                [ -f "build/app/outputs/flutter-apk/app-debug.apk" ]; then
@@ -389,85 +355,112 @@ jobs:
               break
             fi
 
-            log "❌ Attempt $N gagal (gradle exit=$GRADLE_EXIT)"
+            log "❌ Attempt $N gagal."
 
             # ==========================================================
-            # 🔍 DETAIL ERROR — GREP PATTERN LUAS + KONTEKS 80 BARIS
+            # 🔍 PRINT DETAIL ERROR DENGAN LENGKAP
             # ==========================================================
-            log "═══════════════════════════════════════════════════════"
-            log "📋 SEMUA PATTERN ERROR (dari ../gradle.log)"
-            log "═══════════════════════════════════════════════════════"
+            log "═══════════════════════════════════════════════════"
+            log "🔍 CARI DETAIL ERROR DARI BUILD.LOG"
+            log "═══════════════════════════════════════════════════"
 
-            # Pattern 1: What went wrong + 80 baris setelah
-            log "─── [PATTERN-1] What went wrong ───"
-            awk '/What went wrong/ {c=80} c>0 {print; c--}' ../gradle.log | head -100
+            # Cari 'Where:' block
+            log "─── [WHERE] ───"
+            grep -A5 -B1 "^\* Where:" build.log | head -30
 
-            # Pattern 2: Script compilation + Line XX
-            log "─── [PATTERN-2] Script compilation ───"
-            awk '/Script compilation/ {c=80} c>0 {print; c--}' ../gradle.log | head -100
+            # Cari 'Line XX:' (paling penting!)
+            log "─── [LINE XX] ───"
+            grep -E "Line [0-9]+:" build.log | head -50
 
-            # Pattern 3: Line XX:
-            log "─── [PATTERN-3] Line XX ───"
-            grep -nE "^ *Line [0-9]+:|line [0-9]+" ../gradle.log | head -40
+            # Cari 'Unexpected input' / 'expecting' / 'expected'
+            log "─── [UNEXPECTED/EXPECTING] ───"
+            grep -iE "unexpected input|expecting|expected|unresolved|missing" build.log | head -30
 
-            # Pattern 4: error: / Error: / unexpected
-            log "─── [PATTERN-4] error/unexpected ───"
-            grep -inE "error:|Error:|unexpected|expecting|expected|Caused by|startup failed" ../gradle.log | head -40
+            # Cari baris yang menunjuk file
+            log "─── [FILE WITH LINE] ───"
+            grep -E "build\.gradle.*line|build\.gradle\.kts.*line" build.log | head -20
 
-            # Pattern 5: file yang error
-            log "─── [PATTERN-5] build file yang error ───"
-            grep -inE "build file '.*build\.gradle" ../gradle.log | head -20
+            # Cari 'error' umum
+            log "─── [ERROR LINES] ───"
+            grep -iE "^  Line|error:|Error:|ERROR:|Caused by:" build.log | head -40
 
-            log "═══════════════════════════════════════════════════════"
-            log "📋 Semua file gradle saat error:"
-            for f in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts android/app/build.gradle android/app/build.gradle.kts; do
-              [ -f "$f" ] && { log "─── $f ───"; cat "$f"; log "─── END ───"; }
-            done
-            log "═══════════════════════════════════════════════════════"
+            log "═══════════════════════════════════════════════════"
 
             flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool
-            sleep 3
+            sleep 2
           done
 
           # ==========================================================
           # 🐞 FINAL DUMP
           # ==========================================================
           if [ "$SUCCESS" != "true" ]; then
-            log "❌❌❌ SEMUA ATTEMPT GAGAL! ❌❌❌"
+            log "❌ SEMUA ATTEMPT GAGAL — FINAL DUMP"
+
             echo ""
-            echo "═══════════════════════════════════════════════════════"
-            echo "🐞 FINAL FULL DUMP — gradle.log TAIL 800"
-            echo "═══════════════════════════════════════════════════════"
-            tail -800 ../gradle.log 2>/dev/null || echo "(no gradle.log)"
+            echo "═══════════════════════════════════════════════════"
+            echo "🐞 FULL BUILD.LOG — 400 BARIS TERAKHIR"
+            echo "═══════════════════════════════════════════════════"
+            tail -400 build.log
+
             echo ""
-            echo "═══════════════════════════════════════════════════════"
-            echo "🐞 SEMUA ERROR PATTERN"
-            echo "═══════════════════════════════════════════════════════"
-            grep -inE "FAILURE|What went wrong|Script compilation|Line [0-9]+:|error:|Error:|unexpected|expecting|Caused by|startup failed|build file" ../gradle.log 2>/dev/null | head -80
+            echo "═══════════════════════════════════════════════════"
+            echo "🐞 ERROR SECTION — 100 BARIS SEKITAR ERROR"
+            echo "═══════════════════════════════════════════════════"
+            awk '/FAILURE:|What went wrong|Script compilation/ {c=100} c>0 {print; c--}' build.log | head -150
+
             echo ""
-            echo "═══════════════════════════════════════════════════════"
-            echo "🐞 SEMUA FILE GRADLE"
-            echo "═══════════════════════════════════════════════════════"
-            find android -name "*.gradle" -o -name "*.gradle.kts" 2>/dev/null | while read f; do
-              echo ""; echo "───── $f ─────"; cat "$f"; echo "───── END ─────"
+            echo "═══════════════════════════════════════════════════"
+            echo "🐞 LINE XX DETAIL"
+            echo "═══════════════════════════════════════════════════"
+            grep -E "Line [0-9]+:" build.log | head -50
+
+            echo ""
+            echo "═══════════════════════════════════════════════════"
+            echo "🐞 SEMUA FILE GRADLE SETELAH FIX"
+            echo "═══════════════════════════════════════════════════"
+            for f in \
+              android/settings.gradle \
+              android/settings.gradle.kts \
+              android/build.gradle \
+              android/build.gradle.kts \
+              android/app/build.gradle \
+              android/app/build.gradle.kts \
+              android/gradle.properties \
+              android/gradle/wrapper/gradle-wrapper.properties
+            do
+              if [ -f "$f" ]; then
+                echo ""
+                echo "════════ $f ════════"
+                cat -n "$f"
+                echo "════════ END ════════"
+              fi
             done
+
             exit 1
           fi
 
           ls -la build/app/outputs/flutter-apk/ || true
 
       # ==========================================================
-      # 📎 UPLOAD LOG — pasti ada kalau gagal
+      # 📎 UPLOAD diagnostics + logs jadi artifact
       # ==========================================================
-      - name: 📎 Upload Build Logs (kalau gagal)
+      - name: 📎 Upload Build Logs + Gradle Files (kalau gagal)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-failure
+          name: diagnostic-files
           path: |
-            flutter-project/gradle.log
             flutter-project/build.log
+            flutter-project/android/settings.gradle
+            flutter-project/android/settings.gradle.kts
+            flutter-project/android/build.gradle
+            flutter-project/android/build.gradle.kts
+            flutter-project/android/app/build.gradle
+            flutter-project/android/app/build.gradle.kts
+            flutter-project/android/gradle.properties
+            flutter-project/android/gradle/wrapper/gradle-wrapper.properties
+            flutter-project/pubspec.yaml
           retention-days: 7
           if-no-files-found: ignore
 
