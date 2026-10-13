@@ -1,4 +1,4 @@
-name: Build Flutter APK (Auto-Fix Syntax)
+name: Build Flutter APK (Nuclear Auto-Fix)
 
 on:
   push:
@@ -76,14 +76,14 @@ jobs:
       - name: 📱 Install SDK
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-35" "platforms;android-36" \
-                     "build-tools;35.0.0" "build-tools;36.0.0" \
-                     "platform-tools" || true
+          sdkmanager "platforms;android-34" "platforms;android-35" "platforms;android-36" \
+                     "build-tools;34.0.0" "build-tools;35.0.0" "build-tools;36.0.0" \
+                     "platform-tools" "cmdline-tools;latest" || true
 
       - name: 📚 Install Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq imagemagick jq unzip curl file zip p7zip-full
+          sudo apt-get install -y -qq imagemagick jq unzip curl file zip p7zip-full python3
 
       - name: 💾 Cache Gradle
         uses: actions/cache@v4
@@ -134,7 +134,7 @@ jobs:
         run: flutter --version
 
       # ====================================================================
-      # 🧠 AUTO-FIX SYNTAX + BUILD
+      # 🧠 NUCLEAR AUTO-FIX + BUILD
       # ====================================================================
       - name: 🧠 Auto-Fix & Build
         id: autofix
@@ -144,6 +144,113 @@ jobs:
           cd flutter-project
           MODE="${build_type:-release}"
           log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+          # ==========================================================
+          # 🐍 PYTHON FIXER — KTS syntax Groovy → Kotlin
+          # ==========================================================
+          fix_kts_python() {
+            log "🐍 Fix KTS syntax pakai Python..."
+            python3 <<'PYEOF'
+import re
+import os
+
+def fix_kts_file(path):
+    if not os.path.exists(path):
+        return False
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    original = content
+
+    # compileSdk 36 → compileSdk = 36
+    content = re.sub(r'(^|\s)compileSdkVersion\s*=?\s*(\d+)', r'compileSdk = 36', content)
+    content = re.sub(r'(^|\s)compileSdk\s*=?\s*(\d+)', r'compileSdk = 36', content)
+
+    # minSdk 21 → minSdk = 21
+    content = re.sub(r'(^|\s)minSdkVersion\s*=?\s*(\d+)', r'minSdk = 21', content)
+    content = re.sub(r'(^|\s)minSdk\s*=?\s*(\d+)', r'minSdk = 21', content)
+
+    # targetSdk 36 → targetSdk = 36
+    content = re.sub(r'(^|\s)targetSdkVersion\s*=?\s*(\d+)', r'targetSdk = 36', content)
+    content = re.sub(r'(^|\s)targetSdk\s*=?\s*(\d+)', r'targetSdk = 36', content)
+
+    # namespace "x" → namespace = "x"
+    content = re.sub(r'^(\s*)namespace\s+"([^"]+)"', r'\1namespace = "\2"', content, flags=re.M)
+    content = re.sub(r"^(\s*)namespace\s+'([^']+)'", r'\1namespace = "\2"', content, flags=re.M)
+
+    # applicationId "x" → applicationId = "x"
+    content = re.sub(r'^(\s*)applicationId\s+"([^"]+)"', r'\1applicationId = "\2"', content, flags=re.M)
+    content = re.sub(r"^(\s*)applicationId\s+'([^']+)'", r'\1applicationId = "\2"', content, flags=re.M)
+
+    # ndkVersion "x" → ndkVersion = "x"
+    content = re.sub(r'^(\s*)ndkVersion\s+"([^"]+)"', r'\1ndkVersion = "\2"', content, flags=re.M)
+    content = re.sub(r"^(\s*)ndkVersion\s+'([^']+)'", r'\1ndkVersion = "\2"', content, flags=re.M)
+
+    # versionCode flutter.versionCode → versionCode = flutter.versionCode
+    content = re.sub(r'^(\s*)versionCode\s+([^\s=\n]+)', r'\1versionCode = \2', content, flags=re.M)
+    content = re.sub(r'^(\s*)versionName\s+([^\s=\n]+)', r'\1versionName = \2', content, flags=re.M)
+
+    # signingConfig signingConfigs.X → signingConfig = signingConfigs.X
+    content = re.sub(r'signingConfig\s+signingConfigs\.', 'signingConfig = signingConfigs.', content)
+
+    # jvmTarget → "17"
+    content = re.sub(r'jvmTarget\s*=\s*JavaVersion\.VERSION_\d+\.toString\(\)', 'jvmTarget = "17"', content)
+    content = re.sub(r'jvmTarget\s*=\s*JvmTarget\.JVM_\d+', 'jvmTarget = "17"', content)
+    content = re.sub(r'jvmTarget\s*=\s*"[^"]*"', 'jvmTarget = "17"', content)
+    content = re.sub(r"jvmTarget\s*=\s*'[^']*'", 'jvmTarget = "17"', content)
+
+    # sourceCompatibility / targetCompatibility
+    content = re.sub(r'sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+', 'sourceCompatibility = JavaVersion.VERSION_17', content)
+    content = re.sub(r'targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+', 'targetCompatibility = JavaVersion.VERSION_17', content)
+
+    if content != original:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"  ✅ Fixed: {path}")
+        return True
+    else:
+        print(f"  ⏭️  {path} (no change)")
+        return False
+
+# Fix all KTS files
+for f in [
+    'android/app/build.gradle.kts',
+    'android/build.gradle.kts',
+    'android/settings.gradle.kts',
+]:
+    fix_kts_file(f)
+
+# Fix all Groovy files
+def fix_groovy_file(path):
+    if not os.path.exists(path):
+        return False
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    original = content
+
+    content = re.sub(r'(^|\s)compileSdkVersion\s*=?\s*(\d+)', r'compileSdkVersion 36', content)
+    content = re.sub(r'(^|\s)compileSdk\s*=?\s*(\d+)', r'compileSdk 36', content)
+    content = re.sub(r'(^|\s)minSdkVersion\s*=?\s*(\d+)', r'minSdkVersion 21', content)
+    content = re.sub(r'(^|\s)minSdk\s*=?\s*(\d+)', r'minSdk 21', content)
+    content = re.sub(r'(^|\s)targetSdkVersion\s*=?\s*(\d+)', r'targetSdkVersion 36', content)
+    content = re.sub(r'(^|\s)targetSdk\s*=?\s*(\d+)', r'targetSdk 36', content)
+    content = re.sub(r'jvmTarget\s*=\s*"[^"]*"', 'jvmTarget = "17"', content)
+    content = re.sub(r"jvmTarget\s*=\s*'[^']*'", 'jvmTarget = "17"', content)
+    content = re.sub(r'sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+', 'sourceCompatibility JavaVersion.VERSION_17', content)
+    content = re.sub(r'targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+', 'targetCompatibility JavaVersion.VERSION_17', content)
+
+    if content != original:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"  ✅ Fixed: {path}")
+        return True
+    return False
+
+for f in ['android/app/build.gradle', 'android/build.gradle', 'android/settings.gradle']:
+    fix_groovy_file(f)
+
+print("🐍 Python fix done")
+PYEOF
+          }
 
           # ==========================================================
           # 🔧 FIX PUBSPEC
@@ -161,118 +268,76 @@ jobs:
           }
 
           # ==========================================================
-          # 🎯 FIX SYNTAX KTS — Convert Groovy → Kotlin DSL
+          # 🔥 REGENERATE ANDROID FOLDER (Nuclear Option)
           # ==========================================================
-          fix_kts_syntax() {
-            local f="$1"
-            local is_kts="false"
-            [[ "$f" == *.kts ]] && is_kts="true"
+          regenerate_android() {
+            log "🔥 REGENERATE android/ folder (nuclear)..."
 
-            log "🎯 Fix syntax $f (KTS=$is_kts)"
+            # Backup important customizations
+            mkdir -p /tmp/android_backup
+            [ -f android/app/src/main/AndroidManifest.xml ] && cp android/app/src/main/AndroidManifest.xml /tmp/android_backup/ 2>/dev/null
+            [ -d android/app/src/main/res ] && cp -r android/app/src/main/res /tmp/android_backup/res 2>/dev/null
+            [ -f android/app/src/main/kotlin ] && cp -r android/app/src/main/kotlin /tmp/android_backup/kotlin 2>/dev/null
+            [ -f android/app/src/main/java ] && cp -r android/app/src/main/java /tmp/android_backup/java 2>/dev/null
 
-            if [ "$is_kts" = "true" ]; then
-              # ==========================================================
-              # KOTLIN DSL — WAJIB pakai `=`
-              # ==========================================================
+            # Get project name from pubspec
+            PROJECT_NAME=$(grep -E '^name:' pubspec.yaml | head -n1 | sed 's/name:[[:space:]]*//; s/[[:space:]]*$//' || echo "myapp")
+            log "   Project: $PROJECT_NAME"
 
-              # compileSdk (3 variasi: `compileSdk 36`, `compileSdk=36`, `compileSdk = 36`)
-              perl -i -pe 's/\bcompileSdkVersion\s*=?\s*\d+/compileSdk = 36/g' "$f"
-              perl -i -pe 's/\bcompileSdk\s*=?\s*(\d+)/compileSdk = 36/g' "$f"
+            # Remove old android folder
+            rm -rf android
 
-              # minSdk
-              perl -i -pe 's/\bminSdkVersion\s*=?\s*\d+/minSdk = 21/g' "$f"
-              perl -i -pe 's/\bminSdk\s*=?\s*(\d+)/minSdk = 21/g' "$f"
+            # Regenerate via flutter create
+            flutter create --platforms=android --project-name "$PROJECT_NAME" --org com.example . 2>&1 | tee /tmp/fc.log
 
-              # targetSdk
-              perl -i -pe 's/\btargetSdkVersion\s*=?\s*\d+/targetSdk = 36/g' "$f"
-              perl -i -pe 's/\btargetSdk\s*=?\s*(\d+)/targetSdk = 36/g' "$f"
-
-              # Java compatibility — KTS pakai =
-              perl -i -pe 's/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility = JavaVersion.VERSION_17/g' "$f"
-              perl -i -pe 's/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility = JavaVersion.VERSION_17/g' "$f"
-
-              # jvmTarget (4 format: JavaVersion.X.toString(), JvmTarget.JVM_X, "X", 'X')
-              # KTS: boleh string "17" atau JvmTarget.JVM_17 — pakai "17" karena simpel
-              perl -i -pe 's/jvmTarget\s*=\s*JavaVersion\.VERSION_\d+\.toString\(\)/jvmTarget = "17"/g' "$f"
-              perl -i -pe 's/jvmTarget\s*=\s*JvmTarget\.JVM_\d+/jvmTarget = "17"/g' "$f"
-              perl -i -pe 's/jvmTarget\s*=\s*"[^"]*"/jvmTarget = "17"/g' "$f"
-              perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f"
-
-              # Fix kotlinOptions block kalau ada problem
-              # Kalau di KTS ada `kotlinOptions { jvmTarget = "17" }` → tetap valid, tapi bisa deprecation
-              # Biarkan saja, ini gak bikin error
-
-              # namespace (KTS pakai =)
-              perl -i -pe 's/^\s*namespace\s+"([^"]+)"/    namespace = "$1"/g' "$f"
-              perl -i -pe "s/^\s*namespace\s+'([^']+)'/    namespace = \"\$1\"/g" "$f"
-
-              # applicationId (KTS pakai =)
-              perl -i -pe 's/^\s*applicationId\s+"([^"]+)"/        applicationId = "$1"/g' "$f"
-              perl -i -pe "s/^\s*applicationId\s+'([^']+)'/        applicationId = \"\$1\"/g" "$f"
-
-              # versionCode / versionName (KTS pakai =)
-              perl -i -pe 's/^\s*versionCode\s+([^\n=]+)\s*$/        versionCode = $1/g' "$f"
-              perl -i -pe 's/^\s*versionName\s+([^\n=]+)\s*$/        versionName = $1/g' "$f"
-
-              # ndkVersion (KTS pakai =)
-              perl -i -pe 's/^\s*ndkVersion\s+"([^"]+)"/    ndkVersion = "$1"/g' "$f"
-
-              # Fix `signingConfig signingConfigs.X` → `signingConfig = signingConfigs.X`
-              perl -i -pe 's/signingConfig\s+signingConfigs\./signingConfig = signingConfigs./g' "$f"
-
-            else
-              # ==========================================================
-              # GROOVY — TANPA `=` (KECUALI yang sudah ada)
-              # ==========================================================
-
-              sed -i -E 's/\bcompileSdkVersion\s*=?\s*[0-9]+/compileSdkVersion 36/g' "$f" || true
-              sed -i -E 's/\bcompileSdk\s*=?\s*[0-9]+/compileSdk 36/g' "$f" || true
-
-              sed -i -E 's/\bminSdkVersion\s*=?\s*[0-9]+/minSdkVersion 21/g' "$f" || true
-              sed -i -E 's/\bminSdk\s*=?\s*[0-9]+/minSdk 21/g' "$f" || true
-
-              sed -i -E 's/\btargetSdkVersion\s*=?\s*[0-9]+/targetSdkVersion 36/g' "$f" || true
-              sed -i -E 's/\btargetSdk\s*=?\s*[0-9]+/targetSdk 36/g' "$f" || true
-
-              sed -i -E 's/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9_]+/sourceCompatibility JavaVersion.VERSION_17/g' "$f" || true
-              sed -i -E 's/targetCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9_]+/targetCompatibility JavaVersion.VERSION_17/g' "$f" || true
-
-              perl -i -pe 's/jvmTarget\s*=?\s*JavaVersion\.VERSION_\d+\.toString\(\)/jvmTarget = "17"/g' "$f"
-              perl -i -pe 's/jvmTarget\s*=?\s*JvmTarget\.JVM_\d+/jvmTarget = "17"/g' "$f"
-              perl -i -pe 's/jvmTarget\s*=\s*"[^"]*"/jvmTarget = "17"/g' "$f"
-              perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f"
+            if [ ! -f "android/app/build.gradle.kts" ] && [ ! -f "android/app/build.gradle" ]; then
+              log "❌ flutter create gagal regenerate!"
+              tail -20 /tmp/fc.log
+              return 1
             fi
 
-            # Validasi kurawal balance
-            local O C
-            O=$(grep -o "{" "$f" 2>/dev/null | wc -l)
-            C=$(grep -o "}" "$f" 2>/dev/null | wc -l)
-            log "   $f → Kurawal: $O / $C"
+            log "   ✅ Regenerated"
+
+            # Restore AndroidManifest if exists
+            if [ -f /tmp/android_backup/AndroidManifest.xml ]; then
+              cp /tmp/android_backup/AndroidManifest.xml android/app/src/main/AndroidManifest.xml 2>/dev/null
+              log "   ↩️  Restored AndroidManifest.xml"
+            fi
+
+            # Restore res folder (app icons)
+            if [ -d /tmp/android_backup/res ]; then
+              cp -r /tmp/android_backup/res/. android/app/src/main/res/ 2>/dev/null
+              log "   ↩️  Restored res/"
+            fi
+
+            # Copy keystore
+            cp ../release.keystore android/app/ 2>/dev/null || cp release.keystore android/app/ 2>/dev/null
+
+            return 0
           }
 
           # ==========================================================
-          # 🔧 FIX ANDROID CONFIG (keystore + syntax)
+          # 🔧 FIX ANDROID CONFIG (after Python fix, apply keystore etc)
           # ==========================================================
           fix_android_config() {
-            log "🔧 Fix android config..."
+            log "🔧 Fix android config (keystore, SDK, dll)..."
             cd android 2>/dev/null || return 0
             cp ../../release.keystore app/ 2>/dev/null || cp ../release.keystore app/ 2>/dev/null || true
 
             for f in app/build.gradle app/build.gradle.kts; do
               [ -f "$f" ] || continue
-
-              # FIX SYNTAX KTS/GROOVY
-              fix_kts_syntax "$f"
-
-              # Fix keystore (support Groovy & KTS)
+              # Keystore (support both syntax)
               perl -i -pe 's/storeFile\s*=?\s*file\(".*"\)/storeFile = file("release.keystore")/g' "$f"
               perl -i -pe "s/storeFile\s*=?\s*file\('.*'\)/storeFile = file(\"release.keystore\")/g" "$f"
+              perl -i -pe 's/storeFile\s+file\(".*"\)/storeFile = file("release.keystore")/g' "$f"
               perl -i -pe 's/storePassword\s*=?\s*".*"/storePassword = "password"/g' "$f"
+              perl -i -pe "s/storePassword\s*=?\s*'.*'/storePassword = \"password\"/g" "$f"
               perl -i -pe 's/keyAlias\s*=?\s*".*"/keyAlias = "release"/g' "$f"
+              perl -i -pe "s/keyAlias\s*=?\s*'.*'/keyAlias = \"release\"/g" "$f"
               perl -i -pe 's/keyPassword\s*=?\s*".*"/keyPassword = "password"/g' "$f"
+              perl -i -pe "s/keyPassword\s*=?\s*'.*'/keyPassword = \"password\"/g" "$f"
             done
 
-            # gradle.properties
             cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m
           org.gradle.parallel=true
@@ -292,7 +357,7 @@ jobs:
           }
 
           # ==========================================================
-          # 🔧 FIX AGP/KOTLIN
+          # 🔧 FIX AGP/KOTLIN VERSION
           # ==========================================================
           fix_gradle_agp() {
             local AGP="$1"; local KT="$2"
@@ -335,26 +400,39 @@ jobs:
           zipStorePath=wrapper/dists
           EOF
             chmod +x android/gradlew 2>/dev/null || true
-            log "   Gradle wrapper → $GRADLE_REQ"
           }
 
           # ==========================================================
-          # 🚀 MAIN LOOP
+          # 🚀 MAIN LOOP — 4 attempts
           # ==========================================================
-          MAX=3
+          MAX=4
           SUCCESS=false
-          AGP_LIST=("8.11.1" "8.9.1" "8.7.0")
-          KT_LIST=("2.2.20" "2.1.0" "2.0.20")
+          AGP_LIST=("8.11.1" "8.9.1" "8.7.0" "8.9.1")
+          KT_LIST=("2.2.20" "2.1.0" "2.0.20" "2.1.0")
 
           for i in $(seq 0 $((MAX-1))); do
             N=$((i+1))
             log "═══════ ATTEMPT $N / $MAX ═══════"
 
+            # === ATTEMPT 1-2: Python syntax fix ===
+            # === ATTEMPT 3-4: Regenerate android folder ===
+            if [ "$N" -ge 3 ]; then
+              log "🔥 NUCLEAR: regenerate android folder (attempt $N)"
+              regenerate_android || log "⚠️ regenerate gagal, lanjut"
+            fi
+
             fix_pubspec
 
             log "📚 flutter pub get..."
-            flutter pub get 2>&1 | tail -3
+            for j in 1 2 3; do
+              flutter pub get 2>&1 | tail -3 && break
+              sleep 2
+            done
 
+            # === PYTHON FIX (always run) ===
+            fix_kts_python
+
+            # === ANDROID CONFIG FIX ===
             fix_android_config
 
             AGP="${AGP_LIST[$i]:-8.7.0}"
@@ -363,9 +441,13 @@ jobs:
             fix_gradle_wrapper "$AGP"
             log "🎯 AGP=$AGP Kotlin=$KT"
 
-            # Tampilkan hasil fix
-            log "─── app/build.gradle.kts SETELAH fix ───"
-            head -30 android/app/build.gradle.kts 2>/dev/null || head -30 android/app/build.gradle 2>/dev/null
+            # Show fix result
+            log "─── app/build.gradle.kts SETELAH FIX ───"
+            if [ -f android/app/build.gradle.kts ]; then
+              head -40 android/app/build.gradle.kts
+            elif [ -f android/app/build.gradle ]; then
+              head -40 android/app/build.gradle
+            fi
             log "─────────────────────────────────────────"
 
             # ---------- BUILD ----------
@@ -388,12 +470,9 @@ jobs:
 
             log "❌ Attempt $N gagal."
 
-            # ---------- ERROR EXTRACT ----------
-            log "═══════════════════════════════════════════════════"
-            log "🔍 ERROR DETAIL"
-            log "═══════════════════════════════════════════════════"
-            grep -E "^e: file|Line [0-9]+:|Unexpected|expected|Script compilation|What went wrong" build.log | head -30
-            log "═══════════════════════════════════════════════════"
+            log "─────── Error context ───────"
+            grep -E "^e: file|Line [0-9]+:|Unexpected|expected|Script compilation|What went wrong" build.log | head -20
+            log "─────────────────────────────"
 
             flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool
@@ -404,15 +483,16 @@ jobs:
             log "❌ SEMUA ATTEMPT GAGAL"
             echo ""
             echo "═══════════════════════════════════════════════════"
-            echo "🐞 150 baris terakhir build.log"
+            echo "🐞 200 BARIS TERAKHIR"
             echo "═══════════════════════════════════════════════════"
-            tail -150 build.log
-
+            tail -200 build.log
             echo ""
             echo "═══════════════════════════════════════════════════"
-            echo "🐞 app/build.gradle.kts SAAT ERROR"
+            echo "🐞 FILE gradle SAAT ERROR"
             echo "═══════════════════════════════════════════════════"
-            cat -n android/app/build.gradle.kts 2>/dev/null || cat -n android/app/build.gradle 2>/dev/null
+            for f in android/app/build.gradle.kts android/app/build.gradle android/settings.gradle.kts android/settings.gradle; do
+              [ -f "$f" ] && { echo ""; echo "════ $f ════"; cat -n "$f"; echo "════ END ════"; }
+            done
             exit 1
           fi
 
