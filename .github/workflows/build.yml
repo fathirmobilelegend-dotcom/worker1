@@ -121,7 +121,7 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', '**/gradle-wrapper.properties', '**/pubspec.lock') }}-${{ github.sha }}
+          key: gradle-${{ runner.os }}-${{ github.sha }}
           restore-keys: gradle-${{ runner.os }}-
 
       - name: Generate Keystore
@@ -162,28 +162,16 @@ jobs:
             cp -R "$SRC"/. project/ 2>/dev/null || rsync -a "$SRC"/ project/ 2>/dev/null || true
             echo "Flutter project ready"
           else
-            # Prefer the actual Gradle root (settings file), then wrapper, then the shallowest build file.
-            ROOT_FILE=$(find /tmp/ext -maxdepth 6 -type f \
-              \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/.git/*' 2>/dev/null | head -n1)
-            if [ -n "$ROOT_FILE" ]; then
-              SRC=$(dirname "$ROOT_FILE")
+            GL=$(find /tmp/ext -maxdepth 4 -name gradlew -type f | head -n1)
+            if [ -z "$GL" ]; then
+              GL=$(find /tmp/ext -maxdepth 4 \( -name build.gradle -o -name build.gradle.kts \) | head -n1)
+              [ -z "$GL" ] && { echo "build.gradle tidak ditemukan"; exit 1; }
+              GL=$(dirname "$GL")
             else
-              GL=$(find /tmp/ext -maxdepth 6 -type f -name gradlew 2>/dev/null | head -n1)
-              if [ -n "$GL" ]; then
-                SRC=$(dirname "$GL")
-              else
-                GL=$(find /tmp/ext -maxdepth 6 -type f \
-                  \( -name build.gradle -o -name build.gradle.kts \) -printf '%d %p\n' 2>/dev/null | sort -n | head -n1 | cut -d' ' -f2-)
-                [ -n "$GL" ] || { echo "build.gradle/settings.gradle tidak ditemukan"; exit 1; }
-                SRC=$(dirname "$GL")
-                # If the selected build file is a module, move up to a nearby root build file.
-                if [ "$(basename "$SRC")" = "app" ] && [ -f "$(dirname "$SRC")/settings.gradle" -o -f "$(dirname "$SRC")/settings.gradle.kts" ]; then
-                  SRC=$(dirname "$SRC")
-                fi
-              fi
+              GL=$(dirname "$GL")
             fi
-            cp -R "$SRC"/. project/ 2>/dev/null || rsync -a "$SRC"/ project/ 2>/dev/null || true
-            echo "Gradle project root: $SRC"
+            cp -R "$GL"/. project/ 2>/dev/null || rsync -a "$GL"/ project/ 2>/dev/null || true
+            echo "Gradle project ready"
           fi
 
           echo "Project size: $(du -sh project 2>/dev/null)"
@@ -200,12 +188,6 @@ jobs:
       - name: Show Flutter Version
         if: needs.preflight.outputs.project_type == 'flutter'
         run: flutter --version
-
-      - name: Setup Gradle CLI fallback
-        if: needs.preflight.outputs.project_type == 'gradle'
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
 
       - name: Fix Syntax KTS
         shell: bash
@@ -330,46 +312,10 @@ jobs:
           done
           echo "Android config fixed"
 
-      - name: Auto-Fix Gradle and Java Compatibility
-        shell: bash
-        run: |
-          set +e
-          cd project
-          # Normalize legacy Java targets and common Android DSL values without rewriting project logic.
-          find . -type f \( -name "*.gradle" -o -name "*.gradle.kts" \) -not -path "*/.gradle/*" | while read -r f; do
-            sed -i -E \
-              -e 's/JavaVersion\.VERSION_1[0-9]+/JavaVersion.VERSION_17/g' \
-              -e 's/JavaVersion\.VERSION_1[0-9]+/JavaVersion.VERSION_17/g' \
-              "$f" 2>/dev/null || true
-            if [[ "$f" == *.gradle.kts ]]; then
-              sed -i -E \
-                -e 's/(sourceCompatibility[[:space:]]*=[[:space:]]*)JavaVersion\.VERSION_[0-9]+/\1JavaVersion.VERSION_17/g' \
-                -e 's/(targetCompatibility[[:space:]]*=[[:space:]]*)JavaVersion\.VERSION_[0-9]+/\1JavaVersion.VERSION_17/g' \
-                -e 's/(jvmTarget[[:space:]]*=[[:space:]]*)JvmTarget\.JVM_[0-9]+/\1JvmTarget.JVM_17/g' "$f" 2>/dev/null || true
-            fi
-          done
-          # Ensure Gradle wrapper scripts can execute.
-          find . -type f -name gradlew -exec chmod +x {} \; 2>/dev/null || true
-          # Avoid a broken/missing wrapper properties file where a wrapper script exists.
-          while IFS= read -r wrapper; do
-            dir=$(dirname "$wrapper")
-            props="$dir/gradle/wrapper/gradle-wrapper.properties"
-            if [ ! -s "$props" ]; then
-              mkdir -p "$dir/gradle/wrapper"
-              printf '%s\n' \
-                'distributionBase=GRADLE_USER_HOME' \
-                'distributionPath=wrapper/dists' \
-                'distributionUrl=https\://services.gradle.org/distributions/gradle-8.9-all.zip' \
-                'zipStoreBase=GRADLE_USER_HOME' \
-                'zipStorePath=wrapper/dists' > "$props"
-            fi
-          done < <(find . -type f -name gradlew -not -path "*/.gradle/*" 2>/dev/null)
-          echo "Auto-fix compatibility pass completed"
-
       - name: Build
         shell: bash
         run: |
-          set -uo pipefail
+          set +e
           cd project
           MODE="${{ needs.preflight.outputs.build_type }}"
           PTYPE="${{ needs.preflight.outputs.project_type }}"
@@ -387,8 +333,6 @@ jobs:
             AGP="${AGP_LIST[$i]:-8.7.0}"
             KT="${KT_LIST[$i]:-2.0.20}"
 
-            # Preserve the uploaded project on attempt 1; apply compatibility profiles only on retries.
-            if [ "$N" -gt 1 ]; then
             for f in android/settings.gradle android/settings.gradle.kts settings.gradle settings.gradle.kts; do
               [ -f "$f" ] || continue
               sed -i -E "s|(id[[:space:]]*\(?[[:space:]]*[\"']com\.android\.application[\"'][[:space:]]*\)?[[:space:]]+version[[:space:]]+)[\"'][0-9.]+[\"']|\1\"${AGP}\"|g" "$f" 2>/dev/null
@@ -422,51 +366,30 @@ jobs:
                 chmod +x "$d/gradlew" 2>/dev/null || true
               fi
             done
-            if [ ! -f gradlew ] && command -v gradle >/dev/null 2>&1; then
-              gradle wrapper --gradle-version "$GR" --distribution-type all --no-daemon --console=plain > /tmp/wrapper.log 2>&1 || true
-              chmod +x gradlew 2>/dev/null || true
-            fi
 
             echo "AGP=$AGP Kotlin=$KT Gradle=$GR"
-            fi
-            # Remove old outputs so an earlier attempt cannot be mistaken for a successful build.
-            find . -type f -name '*.apk' \
-              \( -path '*/outputs/apk/*' -o -path '*/outputs/flutter-apk/*' \) -delete 2>/dev/null || true
-            rm -f /tmp/out/app-release.apk
             rm -rf build .dart_tool/package_config.json 2>/dev/null || true
 
             if [ "$PTYPE" = "flutter" ]; then
-              set +e
-              flutter pub get > /tmp/pub-get.log 2>&1
-              PUB_RC=$?
-              tail -40 /tmp/pub-get.log
-              set -e
-              if [ "$PUB_RC" -eq 0 ]; then
-                if [ "$MODE" = "release" ]; then
-                  set +e; flutter build apk --release --no-tree-shake-icons > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
-                else
-                  set +e; flutter build apk --debug > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
-                fi
-                tail -80 /tmp/apk-build.log
+              flutter pub get 2>&1 | tail -3
+              if [ "$MODE" = "release" ]; then
+                flutter build apk --release --no-tree-shake-icons 2>&1 | tail -60
               else
-                BUILD_RC=$PUB_RC
-                echo "Dependency resolution failed; will retry with diagnostics."
+                flutter build apk --debug 2>&1 | tail -60
               fi
-              if [ "$BUILD_RC" -eq 0 ] && find build/app/outputs/flutter-apk -type f -name '*.apk' -print -quit 2>/dev/null | grep -q .; then
+              if [ -f "build/app/outputs/flutter-apk/app-${MODE}.apk" ] || [ -f "build/app/outputs/flutter-apk/app-release.apk" ] || [ -f "build/app/outputs/flutter-apk/app-debug.apk" ]; then
                 echo "SUCCESS attempt $N"; SUCCESS=true; break
               fi
             else
               TASK="assembleRelease"
               [ "$MODE" = "debug" ] && TASK="assembleDebug"
               if [ -f gradlew ]; then
-                set +e; ./gradlew "$TASK" --no-daemon --console=plain --stacktrace > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
-                tail -100 /tmp/apk-build.log
+                ./gradlew "$TASK" --no-daemon --console=plain --stacktrace 2>&1 | tail -80
               else
-                set +e; gradle "$TASK" --no-daemon --console=plain --stacktrace > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
-                tail -100 /tmp/apk-build.log
+                gradle "$TASK" --no-daemon --console=plain 2>&1 | tail -80 || gradle wrapper 2>&1 | tail -5
               fi
-              APK=$(find . -type f -name '*.apk' -path '*outputs/apk*' 2>/dev/null | head -n1)
-              if [ "$BUILD_RC" -eq 0 ] && [ -n "$APK" ]; then
+              APK=$(find . -name "*.apk" -path "*outputs/apk*" 2>/dev/null | head -n1)
+              if [ -n "$APK" ]; then
                 echo "SUCCESS attempt $N"
                 mkdir -p /tmp/out
                 cp "$APK" /tmp/out/app-release.apk
@@ -474,11 +397,8 @@ jobs:
               fi
             fi
 
-            echo "Attempt $N failed; collecting likely causes"
-            if [ -f /tmp/apk-build.log ]; then
-              grep -Ei 'error|failed|exception|could not|minimum supported|requires Java|unsupported class|syntax' /tmp/apk-build.log | tail -30 || true
-            fi
-            if [ "$PTYPE" = "flutter" ]; then flutter clean >/dev/null 2>&1 || true; fi
+            echo "Attempt $N failed"
+            flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool 2>/dev/null || true
             sleep 2
           done
