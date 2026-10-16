@@ -162,16 +162,28 @@ jobs:
             cp -R "$SRC"/. project/ 2>/dev/null || rsync -a "$SRC"/ project/ 2>/dev/null || true
             echo "Flutter project ready"
           else
-            GL=$(find /tmp/ext -maxdepth 4 -name gradlew -type f | head -n1)
-            if [ -z "$GL" ]; then
-              GL=$(find /tmp/ext -maxdepth 4 \( -name build.gradle -o -name build.gradle.kts \) | head -n1)
-              [ -z "$GL" ] && { echo "build.gradle tidak ditemukan"; exit 1; }
-              GL=$(dirname "$GL")
+            # Prefer the actual Gradle root (settings file), then wrapper, then the shallowest build file.
+            ROOT_FILE=$(find /tmp/ext -maxdepth 6 -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/.git/*' 2>/dev/null | head -n1)
+            if [ -n "$ROOT_FILE" ]; then
+              SRC=$(dirname "$ROOT_FILE")
             else
-              GL=$(dirname "$GL")
+              GL=$(find /tmp/ext -maxdepth 6 -type f -name gradlew 2>/dev/null | head -n1)
+              if [ -n "$GL" ]; then
+                SRC=$(dirname "$GL")
+              else
+                GL=$(find /tmp/ext -maxdepth 6 -type f \
+                  \( -name build.gradle -o -name build.gradle.kts \) -printf '%d %p\n' 2>/dev/null | sort -n | head -n1 | cut -d' ' -f2-)
+                [ -n "$GL" ] || { echo "build.gradle/settings.gradle tidak ditemukan"; exit 1; }
+                SRC=$(dirname "$GL")
+                # If the selected build file is a module, move up to a nearby root build file.
+                if [ "$(basename "$SRC")" = "app" ] && [ -f "$(dirname "$SRC")/settings.gradle" -o -f "$(dirname "$SRC")/settings.gradle.kts" ]; then
+                  SRC=$(dirname "$SRC")
+                fi
+              fi
             fi
-            cp -R "$GL"/. project/ 2>/dev/null || rsync -a "$GL"/ project/ 2>/dev/null || true
-            echo "Gradle project ready"
+            cp -R "$SRC"/. project/ 2>/dev/null || rsync -a "$SRC"/ project/ 2>/dev/null || true
+            echo "Gradle project root: $SRC"
           fi
 
           echo "Project size: $(du -sh project 2>/dev/null)"
@@ -188,6 +200,12 @@ jobs:
       - name: Show Flutter Version
         if: needs.preflight.outputs.project_type == 'flutter'
         run: flutter --version
+
+      - name: Setup Gradle CLI fallback
+        if: needs.preflight.outputs.project_type == 'gradle'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
       - name: Fix Syntax KTS
         shell: bash
@@ -351,7 +369,7 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          set +e
+          set -uo pipefail
           cd project
           MODE="${{ needs.preflight.outputs.build_type }}"
           PTYPE="${{ needs.preflight.outputs.project_type }}"
@@ -369,6 +387,8 @@ jobs:
             AGP="${AGP_LIST[$i]:-8.7.0}"
             KT="${KT_LIST[$i]:-2.0.20}"
 
+            # Preserve the uploaded project on attempt 1; apply compatibility profiles only on retries.
+            if [ "$N" -gt 1 ]; then
             for f in android/settings.gradle android/settings.gradle.kts settings.gradle settings.gradle.kts; do
               [ -f "$f" ] || continue
               sed -i -E "s|(id[[:space:]]*\(?[[:space:]]*[\"']com\.android\.application[\"'][[:space:]]*\)?[[:space:]]+version[[:space:]]+)[\"'][0-9.]+[\"']|\1\"${AGP}\"|g" "$f" 2>/dev/null
@@ -402,30 +422,51 @@ jobs:
                 chmod +x "$d/gradlew" 2>/dev/null || true
               fi
             done
+            if [ ! -f gradlew ] && command -v gradle >/dev/null 2>&1; then
+              gradle wrapper --gradle-version "$GR" --distribution-type all --no-daemon --console=plain > /tmp/wrapper.log 2>&1 || true
+              chmod +x gradlew 2>/dev/null || true
+            fi
 
             echo "AGP=$AGP Kotlin=$KT Gradle=$GR"
+            fi
+            # Remove old outputs so an earlier attempt cannot be mistaken for a successful build.
+            find . -type f -name '*.apk' \
+              \( -path '*/outputs/apk/*' -o -path '*/outputs/flutter-apk/*' \) -delete 2>/dev/null || true
+            rm -f /tmp/out/app-release.apk
             rm -rf build .dart_tool/package_config.json 2>/dev/null || true
 
             if [ "$PTYPE" = "flutter" ]; then
-              flutter pub get 2>&1 | tail -3
-              if [ "$MODE" = "release" ]; then
-                flutter build apk --release --no-tree-shake-icons 2>&1 | tail -60
+              set +e
+              flutter pub get > /tmp/pub-get.log 2>&1
+              PUB_RC=$?
+              tail -40 /tmp/pub-get.log
+              set -e
+              if [ "$PUB_RC" -eq 0 ]; then
+                if [ "$MODE" = "release" ]; then
+                  set +e; flutter build apk --release --no-tree-shake-icons > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
+                else
+                  set +e; flutter build apk --debug > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
+                fi
+                tail -80 /tmp/apk-build.log
               else
-                flutter build apk --debug 2>&1 | tail -60
+                BUILD_RC=$PUB_RC
+                echo "Dependency resolution failed; will retry with diagnostics."
               fi
-              if [ -f "build/app/outputs/flutter-apk/app-${MODE}.apk" ] || [ -f "build/app/outputs/flutter-apk/app-release.apk" ] || [ -f "build/app/outputs/flutter-apk/app-debug.apk" ]; then
+              if [ "$BUILD_RC" -eq 0 ] && find build/app/outputs/flutter-apk -type f -name '*.apk' -print -quit 2>/dev/null | grep -q .; then
                 echo "SUCCESS attempt $N"; SUCCESS=true; break
               fi
             else
               TASK="assembleRelease"
               [ "$MODE" = "debug" ] && TASK="assembleDebug"
               if [ -f gradlew ]; then
-                ./gradlew "$TASK" --no-daemon --console=plain --stacktrace 2>&1 | tail -80
+                set +e; ./gradlew "$TASK" --no-daemon --console=plain --stacktrace > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
+                tail -100 /tmp/apk-build.log
               else
-                gradle "$TASK" --no-daemon --console=plain 2>&1 | tail -80 || gradle wrapper 2>&1 | tail -5
+                set +e; gradle "$TASK" --no-daemon --console=plain --stacktrace > /tmp/apk-build.log 2>&1; BUILD_RC=$?; set -e
+                tail -100 /tmp/apk-build.log
               fi
-              APK=$(find . -name "*.apk" -path "*outputs/apk*" 2>/dev/null | head -n1)
-              if [ -n "$APK" ]; then
+              APK=$(find . -type f -name '*.apk' -path '*outputs/apk*' 2>/dev/null | head -n1)
+              if [ "$BUILD_RC" -eq 0 ] && [ -n "$APK" ]; then
                 echo "SUCCESS attempt $N"
                 mkdir -p /tmp/out
                 cp "$APK" /tmp/out/app-release.apk
@@ -433,8 +474,11 @@ jobs:
               fi
             fi
 
-            echo "Attempt $N failed"
-            flutter clean >/dev/null 2>&1 || true
+            echo "Attempt $N failed; collecting likely causes"
+            if [ -f /tmp/apk-build.log ]; then
+              grep -Ei 'error|failed|exception|could not|minimum supported|requires Java|unsupported class|syntax' /tmp/apk-build.log | tail -30 || true
+            fi
+            if [ "$PTYPE" = "flutter" ]; then flutter clean >/dev/null 2>&1 || true; fi
             rm -rf build .dart_tool 2>/dev/null || true
             sleep 2
           done
