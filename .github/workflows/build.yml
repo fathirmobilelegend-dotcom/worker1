@@ -121,7 +121,7 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ github.sha }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', '**/gradle-wrapper.properties', '**/pubspec.lock') }}-${{ github.sha }}
           restore-keys: gradle-${{ runner.os }}-
 
       - name: Generate Keystore
@@ -311,6 +311,42 @@ jobs:
             perl -i -pe 's/keyPassword\s*=?\s*".*"/keyPassword = "password"/g' "$f" 2>/dev/null
           done
           echo "Android config fixed"
+
+      - name: Auto-Fix Gradle and Java Compatibility
+        shell: bash
+        run: |
+          set +e
+          cd project
+          # Normalize legacy Java targets and common Android DSL values without rewriting project logic.
+          find . -type f \( -name "*.gradle" -o -name "*.gradle.kts" \) -not -path "*/.gradle/*" | while read -r f; do
+            sed -i -E \
+              -e 's/JavaVersion\.VERSION_1[0-9]+/JavaVersion.VERSION_17/g' \
+              -e 's/JavaVersion\.VERSION_1[0-9]+/JavaVersion.VERSION_17/g' \
+              "$f" 2>/dev/null || true
+            if [[ "$f" == *.gradle.kts ]]; then
+              sed -i -E \
+                -e 's/(sourceCompatibility[[:space:]]*=[[:space:]]*)JavaVersion\.VERSION_[0-9]+/\1JavaVersion.VERSION_17/g' \
+                -e 's/(targetCompatibility[[:space:]]*=[[:space:]]*)JavaVersion\.VERSION_[0-9]+/\1JavaVersion.VERSION_17/g' \
+                -e 's/(jvmTarget[[:space:]]*=[[:space:]]*)JvmTarget\.JVM_[0-9]+/\1JvmTarget.JVM_17/g' "$f" 2>/dev/null || true
+            fi
+          done
+          # Ensure Gradle wrapper scripts can execute.
+          find . -type f -name gradlew -exec chmod +x {} \; 2>/dev/null || true
+          # Avoid a broken/missing wrapper properties file where a wrapper script exists.
+          while IFS= read -r wrapper; do
+            dir=$(dirname "$wrapper")
+            props="$dir/gradle/wrapper/gradle-wrapper.properties"
+            if [ ! -s "$props" ]; then
+              mkdir -p "$dir/gradle/wrapper"
+              printf '%s\n' \
+                'distributionBase=GRADLE_USER_HOME' \
+                'distributionPath=wrapper/dists' \
+                'distributionUrl=https\://services.gradle.org/distributions/gradle-8.9-all.zip' \
+                'zipStoreBase=GRADLE_USER_HOME' \
+                'zipStorePath=wrapper/dists' > "$props"
+            fi
+          done < <(find . -type f -name gradlew -not -path "*/.gradle/*" 2>/dev/null)
+          echo "Auto-fix compatibility pass completed"
 
       - name: Build
         shell: bash
