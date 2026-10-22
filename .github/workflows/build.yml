@@ -235,25 +235,6 @@ jobs:
           done
           echo "Groovy done"
 
-      - name: Gradle Auto Fix - Wrapper, Repositories & Java
-        if: needs.preflight.outputs.project_type == 'gradle'
-        shell: bash
-        run: |
-          set -e
-          cd project
-          echo "=== Gradle Auto Fix ==="
-          # Repair wrapper permissions and normalize common wrapper settings.
-          find . -maxdepth 5 -name gradlew -type f -print0 | while IFS= read -r -d '' f; do chmod +x "$f"; done
-          # Do not rewrite repositories blocks automatically: modern Gradle projects
-          # may use centralized settings.gradle.kts and duplicate blocks break builds.
-          # Use conservative Java 17 defaults without overwriting an existing gradle.properties.
-          mkdir -p .
-          touch gradle.properties
-          grep -q '^org.gradle.jvmargs=' gradle.properties || echo 'org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' >> gradle.properties
-          grep -q '^org.gradle.daemon=' gradle.properties || echo 'org.gradle.daemon=false' >> gradle.properties
-          grep -q '^android.useAndroidX=' gradle.properties || echo 'android.useAndroidX=true' >> gradle.properties
-          echo "Gradle Auto Fix stage complete"
-
       - name: Fix Pubspec
         if: needs.preflight.outputs.project_type == 'flutter'
         shell: bash
@@ -335,7 +316,6 @@ jobs:
         shell: bash
         run: |
           set +e
-          set -o pipefail
           cd project
           MODE="${{ needs.preflight.outputs.build_type }}"
           PTYPE="${{ needs.preflight.outputs.project_type }}"
