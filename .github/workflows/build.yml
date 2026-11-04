@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Tools
+      - name: "Preflight - install detection utilities"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq unzip jq p7zip-full python3 2>/dev/null || true
@@ -97,13 +97,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: "[1/8] Install Java 17"
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK (stable packages)
+      - name: "[2/8] Install Android SDK dan Build Tools"
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -150,12 +150,12 @@ jobs:
           test -d "$ANDROID_HOME/build-tools/36.0.0"
           echo "Android SDK siap digunakan."
 
-      - name: Install Tools
+      - name: "[3/8] Install build utilities (ZIP, ImageMagick, jq)"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq imagemagick jq unzip curl file zip p7zip-full python3
 
-      - name: Cache Gradle
+      - name: "[4/8] Restore Gradle cache"
         uses: actions/cache@v4
         with:
           path: |
@@ -164,11 +164,11 @@ jobs:
           key: gradle-${{ runner.os }}-${{ github.sha }}
           restore-keys: gradle-${{ runner.os }}-
 
-      - name: Generate Keystore
+      - name: "[5/8] Generate signing keystore"
         run: |
           keytool -genkeypair -v -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass password -keypass password -dname "CN=BuildBot, OU=Dev, O=BuildBot, L=City, S=State, C=ID"
 
-      - name: Reassemble & Extract Project
+      - name: "[6/8] Reassemble ZIP dan extract source project"
         shell: bash
         run: |
           rm -f /tmp/project.zip /tmp/ext
@@ -217,7 +217,7 @@ jobs:
           echo "Project size: $(du -sh project 2>/dev/null)"
           ls project/ | head -20
 
-      - name: Setup Flutter ${{ needs.preflight.outputs.flutter_version }}
+      - name: "[7/8] Install Flutter ${{ needs.preflight.outputs.flutter_version }}"
         if: needs.preflight.outputs.project_type == 'flutter'
         uses: subosito/flutter-action@v2
         with:
@@ -270,12 +270,13 @@ jobs:
             perl -i -pe "s/^(\s*)versionCode\s+([^\s=\n]+)/\1versionCode = \2/g" "$f" 2>/dev/null
             perl -i -pe "s/^(\s*)versionName\s+([^\s=\n]+)/\1versionName = \2/g" "$f" 2>/dev/null
             perl -i -pe "s/signingConfig\s+signingConfigs\./signingConfig = signingConfigs./g" "$f" 2>/dev/null
-            perl -i -pe "s/jvmTarget\s*=\s*JavaVersion\.VERSION_\d+\.toString\(\)/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?\.toString\(\)/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*JvmTarget\.JVM_\d+/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*\"[^\"]*\"/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f" 2>/dev/null
-            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
-            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/sourceCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/targetCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/JavaVersion.VERSION_17/g" "$f" 2>/dev/null
           done
           echo "KTS done"
 
@@ -292,8 +293,9 @@ jobs:
             perl -i -pe "s/\btargetSdk\s*=?\s*\d+/targetSdk 36/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*\"[^\"]*\"/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f" 2>/dev/null
-            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
-            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/sourceCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/targetCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/JavaVersion.VERSION_17/g" "$f" 2>/dev/null
           done
           echo "Groovy done"
 
@@ -373,7 +375,7 @@ jobs:
           done
           echo "Android config fixed"
 
-      - name: Build
+      - name: "[8/8] Resolve dependencies dan compile APK"
         shell: bash
         run: |
           set -uo pipefail
@@ -388,9 +390,12 @@ jobs:
           AGP_LIST=("8.11.1" "8.9.1" "8.7.0" "8.3.0")
           KT_LIST=("2.2.20" "2.1.0" "2.0.20" "1.9.0")
 
+          echo "::notice title=Build::Memulai proses build APK"
           for N in $(seq 1 $MAX); do
             i=$((N-1))
+            echo "::group::Percobaan build $N/$MAX"
             echo "===== ATTEMPT $N / $MAX ====="
+            echo "[1/5] Menyiapkan konfigurasi Android Gradle Plugin dan Kotlin"
             AGP="${AGP_LIST[$i]:-8.7.0}"
             KT="${KT_LIST[$i]:-2.0.20}"
 
@@ -429,24 +434,30 @@ jobs:
             done
 
             echo "AGP=$AGP Kotlin=$KT Gradle=$GR"
+            echo "[2/5] Membersihkan cache build sementara"
             rm -rf build .dart_tool/package_config.json 2>/dev/null || true
 
             if [ "$PTYPE" = "flutter" ]; then
               rm -rf build/app/outputs/flutter-apk
+              echo "[3/5] Mengunduh dan memasang dependency Flutter (flutter pub get)"
               if ! flutter pub get 2>&1 | tee "/tmp/pub-get-${N}.log" | tail -40; then
                 echo "pub get failed on attempt $N"
               elif [ "$MODE" = "release" ]; then
+                echo "[4/5] Compile APK mode RELEASE"
                 if flutter build apk --release --no-tree-shake-icons 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -100; then
                   [ -f "build/app/outputs/flutter-apk/app-release.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
                 fi
               else
+                echo "[4/5] Compile APK mode DEBUG"
                 if flutter build apk --debug 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -100; then
                   [ -f "build/app/outputs/flutter-apk/app-debug.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
                 fi
               fi
             else
+              echo "[3/5] Menyiapkan Gradle project dan dependency"
               TASK="assembleRelease"
               [ "$MODE" = "debug" ] && TASK="assembleDebug"
+              echo "[4/5] Menjalankan Gradle task: $TASK"
               if [ -f gradlew ]; then
                 ./gradlew "$TASK" --no-daemon --console=plain --stacktrace 2>&1 | tail -80
               else
@@ -461,6 +472,8 @@ jobs:
               fi
             fi
 
+            echo "::endgroup::"
+            echo "::warning title=Build retry::Percobaan $N gagal; menyiapkan percobaan berikutnya"
             echo "Attempt $N failed"
             flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool 2>/dev/null || true
@@ -474,9 +487,10 @@ jobs:
             done
             exit 1
           fi
+          echo "::notice title=Build selesai::APK berhasil dibuat"
           echo "Build OK"
 
-      - name: Sign APK
+      - name: "[9/10] Sign APK release"
         if: needs.preflight.outputs.build_type == 'release'
         shell: bash
         run: |
@@ -489,7 +503,7 @@ jobs:
           BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
           $ANDROID_HOME/build-tools/$BT/apksigner sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK" 2>/dev/null || true
 
-      - name: Collect APK
+      - name: "[10/10] Collect APK hasil build"
         shell: bash
         run: |
           mkdir -p output
@@ -502,7 +516,7 @@ jobs:
           cp "$APK" output/app-release.apk
           ls -la output/
 
-      - name: Upload APK
+      - name: "Upload APK artifact"
         uses: actions/upload-artifact@v4
         with:
           name: app-release
