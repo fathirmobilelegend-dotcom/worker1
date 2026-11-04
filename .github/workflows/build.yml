@@ -324,6 +324,134 @@ jobs:
           echo "=== Flutter diagnostics ==="
           flutter analyze --no-pub 2>&1 | tee /tmp/flutter-analyze.log || true
 
+      - name: Repair Flutter Gradle DSL
+        if: needs.preflight.outputs.project_type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYGRADLE'
+          from pathlib import Path
+          import re
+
+          roots = [Path('project'), Path.home() / '.pub-cache']
+          changed = []
+
+          def blocks_with_context(text):
+              """Find flutter { ... } blocks nested inside android { ... } blocks."""
+              stack = []
+              found = []
+              i = 0
+              quote = None
+              triple = False
+              line_comment = False
+              block_comment = False
+              while i < len(text):
+                  ch = text[i]
+                  nxt = text[i:i+2]
+                  if line_comment:
+                      if ch == '\n': line_comment = False
+                      i += 1; continue
+                  if block_comment:
+                      if nxt == '*/': block_comment = False; i += 2
+                      else: i += 1
+                      continue
+                  if quote:
+                      if triple:
+                          marker = quote * 3
+                          if text.startswith(marker, i): quote = None; triple = False; i += 3
+                          else: i += 1
+                      else:
+                          if ch == '\\': i += 2
+                          elif ch == quote: quote = None; i += 1
+                          else: i += 1
+                      continue
+                  if nxt == '//': line_comment = True; i += 2; continue
+                  if nxt == '/*': block_comment = True; i += 2; continue
+                  if ch in ('"', "'"):
+                      if text.startswith(ch*3, i): quote = ch; triple = True; i += 3
+                      else: quote = ch; i += 1
+                      continue
+                  if ch == '{':
+                      prefix = text[max(0, i-100):i]
+                      m = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^{}]*\)\s*)?$', prefix)
+                      name = m.group(1) if m else ''
+                      if name == 'flutter' and any(x[0] == 'android' for x in stack):
+                          found.append((i, tuple(x[0] for x in stack)))
+                      stack.append((name, i))
+                  elif ch == '}' and stack:
+                      stack.pop()
+                  i += 1
+              # Resolve matching closing braces for each flutter block.
+              result = []
+              for start, parents in found:
+                  depth = 1; j = start + 1; q = None; tri = False; lc = False; bc = False
+                  while j < len(text) and depth:
+                      c = text[j]; two = text[j:j+2]
+                      if lc:
+                          if c == '\n': lc = False
+                          j += 1; continue
+                      if bc:
+                          if two == '*/': bc = False; j += 2
+                          else: j += 1
+                          continue
+                      if q:
+                          if tri:
+                              if text.startswith(q*3, j): q = None; tri = False; j += 3
+                              else: j += 1
+                          else:
+                              if c == '\\': j += 2
+                              elif c == q: q = None; j += 1
+                              else: j += 1
+                          continue
+                      if two == '//': lc = True; j += 2; continue
+                      if two == '/*': bc = True; j += 2; continue
+                      if c in ('"', "'"):
+                          if text.startswith(c*3, j): q = c; tri = True; j += 3
+                          else: q = c; j += 1
+                          continue
+                      if c == '{': depth += 1
+                      elif c == '}': depth -= 1
+                      j += 1
+                  if depth == 0:
+                      result.append((start, j, parents))
+              return result
+
+          for root in roots:
+              if not root.exists():
+                  continue
+              for f in root.rglob('*'):
+                  if not f.is_file() or f.suffix not in ('.gradle', '.kts'):
+                      continue
+                  try:
+                      original = f.read_text(encoding='utf-8')
+                  except (UnicodeDecodeError, OSError):
+                      continue
+                  blocks = blocks_with_context(original)
+                  if not blocks:
+                      continue
+                  is_app = f.name in ('build.gradle', 'build.gradle.kts') and f.parent.name == 'app' and f.parent.parent.name == 'android'
+                  text = original
+                  move = []
+                  for start, end, parents in reversed(blocks):
+                      block = text[start:end]
+                      if is_app:
+                          move.append(block.strip())
+                      text = text[:start] + text[end:]
+                  if move:
+                      text = text.rstrip() + '\n\n' + '\n\n'.join(reversed(move)) + '\n'
+                  if text != original:
+                      f.write_text(text, encoding='utf-8')
+                      changed.append(str(f))
+
+          print('Flutter Gradle DSL repair complete.')
+          if changed:
+              print('Updated files:')
+              for name in changed:
+                  print(' - ' + name)
+          else:
+              print('No nested flutter {} blocks found; source left unchanged.')
+          PYGRADLE
+
       - name: Fix Android Config
         shell: bash
         run: |
@@ -444,13 +572,25 @@ jobs:
                 echo "pub get failed on attempt $N"
               elif [ "$MODE" = "release" ]; then
                 echo "[4/5] Compile APK mode RELEASE"
-                if flutter build apk --release --no-tree-shake-icons 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -100; then
+                if flutter build apk --release --no-tree-shake-icons 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -120; then
                   [ -f "build/app/outputs/flutter-apk/app-release.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
+                fi
+                if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
+                  echo "::error title=Flutter Gradle DSL::Masih ada flutter {} block di dalam android {} pada modul Android Library. Lihat daftar file hasil Repair Flutter Gradle DSL."
+                  echo "=== Gradle files containing flutter DSL ==="
+                  grep -RIn --include='*.gradle' --include='*.gradle.kts' 'flutter[[:space:]]*{' . "$HOME/.pub-cache" 2>/dev/null | head -80 || true
+                  break
                 fi
               else
                 echo "[4/5] Compile APK mode DEBUG"
-                if flutter build apk --debug 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -100; then
+                if flutter build apk --debug 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -120; then
                   [ -f "build/app/outputs/flutter-apk/app-debug.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
+                fi
+                if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
+                  echo "::error title=Flutter Gradle DSL::Masih ada flutter {} block di dalam android {} pada modul Android Library. Lihat daftar file hasil Repair Flutter Gradle DSL."
+                  echo "=== Gradle files containing flutter DSL ==="
+                  grep -RIn --include='*.gradle' --include='*.gradle.kts' 'flutter[[:space:]]*{' . "$HOME/.pub-cache" 2>/dev/null | head -80 || true
+                  break
                 fi
               fi
             else
