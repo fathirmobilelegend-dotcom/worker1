@@ -56,27 +56,37 @@ jobs:
 
       - name: Detect Flutter Version
         id: detect
+        shell: bash
         run: |
-          rm -rf /tmp/fc
-          mkdir -p /tmp/fc
-          7z x /tmp/project.zip -o/tmp/fc -y > /dev/null 2>&1 || unzip -o -q /tmp/project.zip -d /tmp/fc 2>/dev/null || true
-          PUB=$(find /tmp/fc -maxdepth 4 -name pubspec.yaml -not -path '*/.*' | head -n1)
-          if [ -z "$PUB" ]; then
-            echo "flutter_version=3.35.2" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          rm -rf /tmp/fc && mkdir -p /tmp/fc
+          7z x /tmp/project.zip -o/tmp/fc -y -bso0 -bsp0 >/dev/null 2>&1 || unzip -oq /tmp/project.zip -d /tmp/fc
+          # Prefer the shallowest pubspec so a nested example/plugin cannot override the app.
+          PUB=$(find /tmp/fc -maxdepth 6 -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "${PUB:-}" ]; then
+            echo "flutter_version=3.35.2" >> "$GITHUB_OUTPUT"
+            echo "No pubspec found; using current stable fallback 3.35.2"
             exit 0
           fi
-          SDK=$(grep -A3 '^environment:' "$PUB" | grep 'sdk:' | head -n1 | sed 's/.*sdk:[[:space:]]*//; s/["'"'"']//g' || echo "")
-          DART=$(echo "$SDK" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || echo "")
-          FV="3.35.2"
-          case "$DART" in
-            "3.8") FV="3.32.0" ;;
-            "3.7") FV="3.29.0" ;;
-            "3.6") FV="3.27.0" ;;
-            "3.5") FV="3.24.0" ;;
-            "3.4") FV="3.22.0" ;;
-          esac
-          echo "flutter_version=$FV" >> $GITHUB_OUTPUT
-          echo "Flutter: $FV"
+          echo "Detected pubspec: $PUB"
+          python3 - "$PUB" <<'PYDETECT' >> "$GITHUB_OUTPUT"
+          import re, sys
+          text = open(sys.argv[1], encoding='utf-8').read()
+          m = re.search(r'(?ms)^environment\s*:\s*\n(?:(?:[ \t]+.*)\n)*?[ \t]+sdk\s*:\s*[\"\']?([^\n#]+)', text)
+          constraint = m.group(1).strip().strip('\"\'') if m else ''
+          # Select the oldest stable Flutter release known to include the requested Dart SDK.
+          versions = [(3,4,'3.22.0'), (3,5,'3.24.0'), (3,6,'3.27.0'),
+                      (3,7,'3.29.0'), (3,8,'3.32.0'), (3,9,'3.35.2')]
+          nums = re.findall(r'(?<![0-9])(3)\.(\d+)', constraint)
+          lower = (3, 0)
+          if nums:
+              # >= and caret constraints use the first version as the minimum.
+              lower = (int(nums[0][0]), int(nums[0][1]))
+          chosen = next((v for major, minor, v in versions if (major, minor) >= lower), 'stable' if lower > (3, 9) else '3.35.2')
+          print(f'flutter_version={chosen}')
+          print(f'dart_constraint={constraint or "unspecified"}')
+          PYDETECT
+          echo "Flutter selected from Dart constraint: $(grep '^flutter_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
 
   build:
     name: Build APK
@@ -95,20 +105,18 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          packages: |-
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
 
-      - name: Install Android SDK
+      - name: Accept Android SDK licenses
+        shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-33" > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-34" > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-35" > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-36" > /dev/null 2>&1 || true
-          sdkmanager "build-tools;33.0.2" > /dev/null 2>&1 || true
-          sdkmanager "build-tools;34.0.0" > /dev/null 2>&1 || true
-          sdkmanager "build-tools;35.0.0" > /dev/null 2>&1 || true
-          sdkmanager "build-tools;36.0.0" > /dev/null 2>&1 || true
-          sdkmanager "platform-tools" > /dev/null 2>&1 || true
-          sdkmanager "cmdline-tools;latest" > /dev/null 2>&1 || true
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
 
       - name: Install Tools
         run: |
@@ -156,7 +164,7 @@ jobs:
           fi
 
           if [ "${{ needs.preflight.outputs.project_type }}" = "flutter" ]; then
-            PUB=$(find /tmp/ext -maxdepth 4 -name pubspec.yaml -not -path '*/.*' | head -n1)
+            PUB=$(find /tmp/ext -maxdepth 6 -type f -name pubspec.yaml -not -path '*/.*' -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
             if [ -z "$PUB" ]; then echo "pubspec.yaml tidak ditemukan"; ls -la /tmp/ext; exit 1; fi
             SRC=$(dirname "$PUB")
             cp -R "$SRC"/. project/ 2>/dev/null || rsync -a "$SRC"/ project/ 2>/dev/null || true
@@ -185,9 +193,31 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Show Flutter Version
+      - name: Show and verify Flutter/Dart Version
         if: needs.preflight.outputs.project_type == 'flutter'
-        run: flutter --version
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+          REQUIRED=$(python3 - <<'PYSDK'
+          import re
+          text = open('project/pubspec.yaml', encoding='utf-8').read()
+          match = re.search(r'(?ms)^environment\s*:\s*\n(?:(?:[ \t]+.*)\n)*?[ \t]+sdk\s*:\s*["\']?([^\n#]+)', text)
+          print(match.group(1).strip().strip('"\'') if match else '')
+          PYSDK
+          )
+          echo "Project Dart SDK constraint: ${REQUIRED:-not declared}"
+          DART_VERSION=$(dart --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+          if [ -n "$REQUIRED" ] && [[ "$REQUIRED" =~ \>=[[:space:]]*([0-9]+\.[0-9]+) ]]; then
+            MIN="${BASH_REMATCH[1]}"
+            DART_MINOR=$(echo "$DART_VERSION" | cut -d. -f2)
+            MIN_MINOR=$(echo "$MIN" | cut -d. -f2)
+            if [ "$DART_MINOR" -lt "$MIN_MINOR" ]; then
+              echo "ERROR: Dart $DART_VERSION is below required $MIN"
+              exit 1
+            fi
+          fi
 
       - name: Fix Syntax KTS
         shell: bash
@@ -235,31 +265,30 @@ jobs:
           done
           echo "Groovy done"
 
-      - name: Fix Pubspec
+      - name: Validate Pubspec (non-destructive)
         if: needs.preflight.outputs.project_type == 'flutter'
         shell: bash
         run: |
+          set -euo pipefail
           cd project
-          sed -i -E "s|sdk:[[:space:]]*['\"]?[>=^~ ]*3\.[0-9.]+[^'\"]*['\"]?|sdk: '>=3.6.0 <4.0.0'|g" pubspec.yaml || true
-          sed -i -E "s|webview_flutter:[[:space:]]*[^[:space:]]+|webview_flutter: ^4.13.0|g" pubspec.yaml || true
-          sed -i -E "s|geolocator:[[:space:]]*[^[:space:]]+|geolocator: ^13.0.4|g" pubspec.yaml || true
-          sed -i -E "s|firebase_core:[[:space:]]*[^[:space:]]+|firebase_core: ^2.32.0|g" pubspec.yaml || true
-          sed -i -E "s|firebase_auth:[[:space:]]*[^[:space:]]+|firebase_auth: ^4.19.0|g" pubspec.yaml || true
-          sed -i -E "s|cloud_firestore:[[:space:]]*[^[:space:]]+|cloud_firestore: ^4.17.5|g" pubspec.yaml || true
-          sed -i -E "s|image_picker:[[:space:]]*[^[:space:]]+|image_picker: ^1.1.2|g" pubspec.yaml || true
-          sed -i -E "s|file_picker:[[:space:]]*[^[:space:]]+|file_picker: ^6.2.1|g" pubspec.yaml || true
-          sed -i -E "s|permission_handler:[[:space:]]*[^[:space:]]+|permission_handler: ^11.3.1|g" pubspec.yaml || true
-          sed -i -E "s|flutter_local_notifications:[[:space:]]*[^[:space:]]+|flutter_local_notifications: ^17.2.4|g" pubspec.yaml || true
-          sed -i -E "s|workmanager:[[:space:]]*[^[:space:]]+|workmanager: ^0.5.2|g" pubspec.yaml || true
-          sed -i -E "s|google_maps_flutter:[[:space:]]*[^[:space:]]+|google_maps_flutter: ^2.9.0|g" pubspec.yaml || true
-          sed -i -E "s|dio:[[:space:]]*[^[:space:]]+|dio: ^5.7.0|g" pubspec.yaml || true
-          sed -i -E "s|video_player:[[:space:]]*[^[:space:]]+|video_player: ^2.9.1|g" pubspec.yaml || true
-          sed -i -E "s|sqflite:[[:space:]]*[^[:space:]]+|sqflite: ^2.3.3+1|g" pubspec.yaml || true
-          sed -i -E "s|shared_preferences:[[:space:]]*[^[:space:]]+|shared_preferences: ^2.3.2|g" pubspec.yaml || true
-          sed -i -E "s|url_launcher:[[:space:]]*[^[:space:]]+|url_launcher: ^6.3.1|g" pubspec.yaml || true
-          sed -i -E "s|intl:[[:space:]]*[^[:space:]]+|intl: ^0.19.0|g" pubspec.yaml || true
-          rm -f pubspec.lock
-          echo "Pubspec done"
+          test -f pubspec.yaml || { echo "pubspec.yaml tidak ditemukan di root project"; exit 1; }
+          # Normalize line endings only. Keep the project's SDK constraint and dependency versions intact.
+          sed -i 's/\r$//' pubspec.yaml
+          echo "Pubspec ditemukan; dependency dan SDK constraint dipertahankan."
+
+      - name: Flutter Auto Fix
+        if: needs.preflight.outputs.project_type == 'flutter'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd project
+          flutter pub get 2>&1 | tee /tmp/flutter-pub-get-prefx.log | tail -60 || true
+          echo "=== Dart formatter ==="
+          dart format --output=write lib test 2>&1 || dart format --output=write lib 2>&1 || true
+          echo "=== Apply supported Dart quick fixes ==="
+          dart fix --apply 2>&1 || true
+          echo "=== Flutter diagnostics ==="
+          flutter analyze --no-pub 2>&1 | tee /tmp/flutter-analyze.log || true
 
       - name: Fix Android Config
         shell: bash
@@ -315,7 +344,7 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          set +e
+          set -uo pipefail
           cd project
           MODE="${{ needs.preflight.outputs.build_type }}"
           PTYPE="${{ needs.preflight.outputs.project_type }}"
@@ -371,14 +400,17 @@ jobs:
             rm -rf build .dart_tool/package_config.json 2>/dev/null || true
 
             if [ "$PTYPE" = "flutter" ]; then
-              flutter pub get 2>&1 | tail -3
-              if [ "$MODE" = "release" ]; then
-                flutter build apk --release --no-tree-shake-icons 2>&1 | tail -60
+              rm -rf build/app/outputs/flutter-apk
+              if ! flutter pub get 2>&1 | tee "/tmp/pub-get-${N}.log" | tail -40; then
+                echo "pub get failed on attempt $N"
+              elif [ "$MODE" = "release" ]; then
+                if flutter build apk --release --no-tree-shake-icons 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -100; then
+                  [ -f "build/app/outputs/flutter-apk/app-release.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
+                fi
               else
-                flutter build apk --debug 2>&1 | tail -60
-              fi
-              if [ -f "build/app/outputs/flutter-apk/app-${MODE}.apk" ] || [ -f "build/app/outputs/flutter-apk/app-release.apk" ] || [ -f "build/app/outputs/flutter-apk/app-debug.apk" ]; then
-                echo "SUCCESS attempt $N"; SUCCESS=true; break
+                if flutter build apk --debug 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -100; then
+                  [ -f "build/app/outputs/flutter-apk/app-debug.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
+                fi
               fi
             else
               TASK="assembleRelease"
