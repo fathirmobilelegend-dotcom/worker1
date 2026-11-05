@@ -144,10 +144,12 @@ jobs:
           install_sdk_package "platform-tools"
           install_sdk_package "platforms;android-36"
           install_sdk_package "build-tools;36.0.0"
+          install_sdk_package "ndk;27.0.12077973"
 
           test -x "$ANDROID_HOME/platform-tools/adb"
           test -d "$ANDROID_HOME/platforms/android-36"
           test -d "$ANDROID_HOME/build-tools/36.0.0"
+          test -d "$ANDROID_HOME/ndk/27.0.12077973"
           echo "Android SDK siap digunakan."
 
       - name: "[3/8] Install build utilities (ZIP, ImageMagick, jq)"
@@ -339,14 +341,10 @@ jobs:
           from pathlib import Path
           import os, re
 
+          # Scan only the uploaded project and Pub cache. Never rewrite Flutter SDK internals.
+          # This pass only repairs the uploaded project's nested blocks.
+          # Dependency caches are handled by the targeted constant-repair pass below.
           roots = [Path('project')]
-          for value in (os.environ.get('PUB_CACHE'), str(Path.home() / '.pub-cache'), os.environ.get('FLUTTER_ROOT')):
-              if value:
-                  roots.append(Path(value))
-          # Flutter's Gradle integration can also be resolved from the SDK/cache.
-          if os.environ.get('FLUTTER_ROOT'):
-              roots.append(Path(os.environ['FLUTTER_ROOT']) / 'packages' / 'flutter_tools' / 'gradle')
-          roots = list(dict.fromkeys(p for p in roots if p and p.exists()))
 
           def gradle_files(root):
               try:
@@ -457,6 +455,73 @@ jobs:
               raise SystemExit(2)
           print('Flutter Gradle DSL validation passed.')
           PYGRADLE
+
+      - name: Repair Flutter SDK references in Android Library modules
+        if: needs.preflight.outputs.project_type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYLIB'
+          from pathlib import Path
+          import os, re
+
+          roots = [Path('project')]
+          cache = Path(os.environ.get('PUB_CACHE') or (Path.home() / '.pub-cache'))
+          if cache.exists(): roots.append(cache)
+          replacements = {
+              'compileSdkVersion': '36',
+              'compileSdk': '36',
+              'minSdkVersion': '21',
+              'minSdk': '21',
+              'targetSdkVersion': '36',
+              'targetSdk': '36',
+              'ndkVersion': '\"27.0.12077973\"',
+          }
+          changed = []
+          scanned = 0
+          for root in roots:
+              if not root.exists(): continue
+              for f in root.rglob('*'):
+                  if not f.is_file() or not (f.name.endswith('.gradle') or f.name.endswith('.gradle.kts')):
+                      continue
+                  # The app module needs the Flutter Gradle plugin extension; preserve it.
+                  normalized = f.as_posix()
+                  if normalized in ('project/android/app/build.gradle', 'project/android/app/build.gradle.kts'):
+                      continue
+                  try: original = f.read_text(encoding='utf-8')
+                  except (UnicodeDecodeError, OSError): continue
+                  scanned += 1
+                  updated = original
+                  for key, value in replacements.items():
+                      updated = re.sub(r'\bflutter\.' + re.escape(key) + r'\b', value, updated)
+                  if updated != original:
+                      f.write_text(updated, encoding='utf-8')
+                      changed.append((f, original, updated))
+          print(f'Scanned {scanned} Gradle files for Flutter SDK constants in Android library/dependency modules.')
+          for f, before, after in changed:
+              print(f'Patched Flutter SDK constants: {f}')
+              for n, line in enumerate(before.splitlines(), 1):
+                  if re.search(r'\bflutter\.(?:compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)\b', line):
+                      print(f'  original line {n}: {line.strip()}')
+          # Verify no SDK constant references remain outside the app module.
+          remaining = []
+          for root in roots:
+              if not root.exists(): continue
+              for f in root.rglob('*'):
+                  if not f.is_file() or not (f.name.endswith('.gradle') or f.name.endswith('.gradle.kts')): continue
+                  normalized = f.as_posix()
+                  if normalized in ('project/android/app/build.gradle', 'project/android/app/build.gradle.kts'): continue
+                  try: content = f.read_text(encoding='utf-8')
+                  except (UnicodeDecodeError, OSError): continue
+                  for n, line in enumerate(content.splitlines(), 1):
+                      if re.search(r'\bflutter\.(?:compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)\b', line):
+                          remaining.append(f'{f}:{n}: {line.strip()}')
+          if remaining:
+              print('ERROR: unresolved Flutter SDK constants:')
+              print('\\n'.join(remaining[:100]))
+              raise SystemExit(3)
+          print('Flutter SDK constant repair validation passed.')
+          PYLIB
 
       - name: Fix Android Config
         shell: bash
@@ -582,9 +647,11 @@ jobs:
                   [ -f "build/app/outputs/flutter-apk/app-release.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
                 fi
                 if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
-                  echo "::error title=Flutter Gradle DSL::Masih ada flutter {} block di dalam android {} pada modul Android Library. Lihat daftar file hasil Repair Flutter Gradle DSL."
-                  echo "=== Gradle files containing flutter DSL ==="
-                  grep -RIn --include='*.gradle' --include='*.gradle.kts' 'flutter[[:space:]]*{' . "$HOME/.pub-cache" 2>/dev/null | head -80 || true
+                  echo "::error title=Flutter Gradle configuration::Gradle masih menemukan referensi Flutter yang tidak tersedia pada Android Library. Lihat stacktrace dan daftar referensi di bawah."
+                  echo "=== Gradle references to Flutter SDK values ==="
+                  grep -RInE --include='*.gradle' --include='*.gradle.kts' 'flutter\.(compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)' . "$HOME/.pub-cache" 2>/dev/null | head -100 || true
+                  echo "=== Gradle stacktrace diagnostic ==="
+                  if [ -x android/gradlew ]; then (cd android && ./gradlew app:assembleRelease --no-daemon --console=plain --stacktrace) 2>&1 | tee /tmp/gradle-library-diagnostic.log | tail -160 || true; fi
                   break
                 fi
               else
@@ -593,9 +660,11 @@ jobs:
                   [ -f "build/app/outputs/flutter-apk/app-debug.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
                 fi
                 if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
-                  echo "::error title=Flutter Gradle DSL::Masih ada flutter {} block di dalam android {} pada modul Android Library. Lihat daftar file hasil Repair Flutter Gradle DSL."
-                  echo "=== Gradle files containing flutter DSL ==="
-                  grep -RIn --include='*.gradle' --include='*.gradle.kts' 'flutter[[:space:]]*{' . "$HOME/.pub-cache" 2>/dev/null | head -80 || true
+                  echo "::error title=Flutter Gradle configuration::Gradle masih menemukan referensi Flutter yang tidak tersedia pada Android Library. Lihat stacktrace dan daftar referensi di bawah."
+                  echo "=== Gradle references to Flutter SDK values ==="
+                  grep -RInE --include='*.gradle' --include='*.gradle.kts' 'flutter\.(compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)' . "$HOME/.pub-cache" 2>/dev/null | head -100 || true
+                  echo "=== Gradle stacktrace diagnostic ==="
+                  if [ -x android/gradlew ]; then (cd android && ./gradlew app:assembleRelease --no-daemon --console=plain --stacktrace) 2>&1 | tee /tmp/gradle-library-diagnostic.log | tail -160 || true; fi
                   break
                 fi
               fi
