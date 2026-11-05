@@ -71,7 +71,9 @@ jobs:
           echo "Detected pubspec: $PUB"
           python3 - "$PUB" <<'PYDETECT' >> "$GITHUB_OUTPUT"
           import re, sys
-          text = open(sys.argv[1], encoding='utf-8').read()
+          from pathlib import Path
+          pub_path = Path(sys.argv[1])
+          text = pub_path.read_text(encoding='utf-8')
           m = re.search(r'(?ms)^environment\s*:\s*\n(?:(?:[ \t]+.*)\n)*?[ \t]+sdk\s*:\s*[\"\']?([^\n#]+)', text)
           constraint = m.group(1).strip().strip('\"\'') if m else ''
           # Select the oldest stable Flutter release known to include the requested Dart SDK.
@@ -83,8 +85,20 @@ jobs:
               # >= and caret constraints use the first version as the minimum.
               lower = (int(nums[0][0]), int(nums[0][1]))
           chosen = next((v for major, minor, v in versions if (major, minor) >= lower), 'stable' if lower > (3, 9) else '3.35.2')
+
+          # flutter_webrtc 0.12.12 migrated to TextureRegistry.SurfaceProducer.Callback.
+          # That Android embedding API is not present in Flutter 3.22; use Flutter 3.29+
+          # when this plugin is in the app dependency graph.
+          lock_path = pub_path.parent / 'pubspec.lock'
+          lock_text = lock_path.read_text(encoding='utf-8', errors='replace') if lock_path.exists() else ''
+          has_webrtc = bool(re.search(r'(?m)^  flutter_webrtc:\s*$', lock_text)) or bool(re.search(r'(?m)^\s*flutter_webrtc\s*:', text))
+          if has_webrtc and (3, int(chosen.split('.')[1]) if chosen.startswith('3.') else 99) < (3, 29):
+              chosen = '3.29.0'
           print(f'flutter_version={chosen}')
           print(f'dart_constraint={constraint or "unspecified"}')
+          print(f'flutter_webrtc_detected={str(has_webrtc).lower()}')
+          if has_webrtc:
+              print('flutter_webrtc_min_flutter=3.29.0')
           PYDETECT
           echo "Flutter selected from Dart constraint: $(grep '^flutter_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
 
@@ -567,6 +581,12 @@ jobs:
 
           for f in android/app/build.gradle android/app/build.gradle.kts; do
             [ -f "$f" ] || continue
+            # Match the NDK installed in step [2/8], including projects using flutter.ndkVersion.
+            if [[ "$f" == *.kts ]]; then
+              sed -i -E 's/ndkVersion[[:space:]]*=[[:space:]]*flutter\.ndkVersion/ndkVersion = "27.0.12077973"/g; s/ndkVersion[[:space:]]+flutter\.ndkVersion/ndkVersion = "27.0.12077973"/g' "$f"
+            else
+              sed -i -E 's/ndkVersion[[:space:]]*=?[[:space:]]*flutter\.ndkVersion/ndkVersion "27.0.12077973"/g' "$f"
+            fi
             perl -i -pe 's/storeFile\s*=?\s*file\(".*"\)/storeFile = file("release.keystore")/g' "$f" 2>/dev/null
             perl -i -pe 's/storePassword\s*=?\s*".*"/storePassword = "password"/g' "$f" 2>/dev/null
             perl -i -pe 's/keyAlias\s*=?\s*".*"/keyAlias = "release"/g' "$f" 2>/dev/null
@@ -646,6 +666,10 @@ jobs:
                 if flutter build apk --release --no-tree-shake-icons 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -120; then
                   [ -f "build/app/outputs/flutter-apk/app-release.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
                 fi
+                if grep -Eqi 'flutter_webrtc.*SurfaceProducer\.Callback|SurfaceProducer\.Callback' "/tmp/flutter-build-${N}.log"; then
+                  echo "::error title=Flutter WebRTC compatibility::flutter_webrtc memakai SurfaceProducer.Callback tetapi Flutter SDK yang terpasang belum mendukung API tersebut. Pastikan preflight memilih Flutter 3.29.0 atau lebih baru."
+                  break
+                fi
                 if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
                   echo "::error title=Flutter Gradle configuration::Gradle masih menemukan referensi Flutter yang tidak tersedia pada Android Library. Lihat stacktrace dan daftar referensi di bawah."
                   echo "=== Gradle references to Flutter SDK values ==="
@@ -658,6 +682,10 @@ jobs:
                 echo "[4/5] Compile APK mode DEBUG"
                 if flutter build apk --debug 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -120; then
                   [ -f "build/app/outputs/flutter-apk/app-debug.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
+                fi
+                if grep -Eqi 'flutter_webrtc.*SurfaceProducer\.Callback|SurfaceProducer\.Callback' "/tmp/flutter-build-${N}.log"; then
+                  echo "::error title=Flutter WebRTC compatibility::flutter_webrtc memakai SurfaceProducer.Callback tetapi Flutter SDK yang terpasang belum mendukung API tersebut. Pastikan preflight memilih Flutter 3.29.0 atau lebih baru."
+                  break
                 fi
                 if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
                   echo "::error title=Flutter Gradle configuration::Gradle masih menemukan referensi Flutter yang tidak tersedia pada Android Library. Lihat stacktrace dan daftar referensi di bawah."
