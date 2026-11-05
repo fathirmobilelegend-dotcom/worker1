@@ -243,12 +243,18 @@ jobs:
           DART_VERSION=$(dart --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
           if [ -n "$REQUIRED" ] && [[ "$REQUIRED" =~ \>=[[:space:]]*([0-9]+\.[0-9]+) ]]; then
             MIN="${BASH_REMATCH[1]}"
-            DART_MINOR=$(echo "$DART_VERSION" | cut -d. -f2)
-            MIN_MINOR=$(echo "$MIN" | cut -d. -f2)
-            if [ "$DART_MINOR" -lt "$MIN_MINOR" ]; then
-              echo "ERROR: Dart $DART_VERSION is below required $MIN"
-              exit 1
-            fi
+            if ! python3 - "$DART_VERSION" "$MIN" <<'PYVER'
+          import re, sys
+          def parts(value):
+              m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", value)
+              return tuple(int(x or 0) for x in m.groups()) if m else (0, 0, 0)
+          if parts(sys.argv[1]) < parts(sys.argv[2]):
+              print(f"ERROR: Dart {sys.argv[1]} is below required {sys.argv[2]}")
+              raise SystemExit(1)
+          PYVER
+          then
+            exit 1
+          fi
           fi
 
       - name: Fix Syntax KTS
@@ -331,125 +337,125 @@ jobs:
           set -euo pipefail
           python3 - <<'PYGRADLE'
           from pathlib import Path
-          import re
+          import os, re
 
-          roots = [Path('project'), Path.home() / '.pub-cache']
-          changed = []
+          roots = [Path('project')]
+          for value in (os.environ.get('PUB_CACHE'), str(Path.home() / '.pub-cache'), os.environ.get('FLUTTER_ROOT')):
+              if value:
+                  roots.append(Path(value))
+          # Flutter's Gradle integration can also be resolved from the SDK/cache.
+          if os.environ.get('FLUTTER_ROOT'):
+              roots.append(Path(os.environ['FLUTTER_ROOT']) / 'packages' / 'flutter_tools' / 'gradle')
+          roots = list(dict.fromkeys(p for p in roots if p and p.exists()))
 
-          def blocks_with_context(text):
-              """Find flutter { ... } blocks nested inside android { ... } blocks."""
-              stack = []
-              found = []
-              i = 0
-              quote = None
-              triple = False
-              line_comment = False
-              block_comment = False
-              while i < len(text):
-                  ch = text[i]
-                  nxt = text[i:i+2]
+          def gradle_files(root):
+              try:
+                  for f in root.rglob('*'):
+                      if f.is_file() and (f.name.endswith('.gradle') or f.name.endswith('.gradle.kts')):
+                          yield f
+              except (OSError, PermissionError):
+                  return
+
+          def nested_flutter_blocks(src):
+              # Lex Gradle source, ignoring comments and quoted strings, and retain
+              # the exact ranges of flutter { ... } blocks inside android { ... }.
+              stack, found = [], []
+              i, n = 0, len(src)
+              quote = None; triple = False; line_comment = False; block_comment = False
+              while i < n:
+                  c = src[i]; pair = src[i:i+2]
                   if line_comment:
-                      if ch == '\n': line_comment = False
+                      if c == '\n': line_comment = False
                       i += 1; continue
                   if block_comment:
-                      if nxt == '*/': block_comment = False; i += 2
+                      if pair == '*/': block_comment = False; i += 2
                       else: i += 1
                       continue
                   if quote:
                       if triple:
-                          marker = quote * 3
-                          if text.startswith(marker, i): quote = None; triple = False; i += 3
+                          if src.startswith(quote * 3, i): quote = None; triple = False; i += 3
                           else: i += 1
                       else:
-                          if ch == '\\': i += 2
-                          elif ch == quote: quote = None; i += 1
+                          if c == '\\': i += 2
+                          elif c == quote: quote = None; i += 1
                           else: i += 1
                       continue
-                  if nxt == '//': line_comment = True; i += 2; continue
-                  if nxt == '/*': block_comment = True; i += 2; continue
-                  if ch in ('"', "'"):
-                      if text.startswith(ch*3, i): quote = ch; triple = True; i += 3
-                      else: quote = ch; i += 1
+                  if pair == '//': line_comment = True; i += 2; continue
+                  if pair == '/*': block_comment = True; i += 2; continue
+                  if c in ('\"', "'"):
+                      if src.startswith(c * 3, i): quote = c; triple = True; i += 3
+                      else: quote = c; i += 1
                       continue
-                  if ch == '{':
-                      prefix = text[max(0, i-100):i]
+                  if c == '{':
+                      prefix = src[max(0, i-240):i]
+                      # Match the block label immediately preceding this opening brace.
                       m = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^{}]*\)\s*)?$', prefix)
                       name = m.group(1) if m else ''
-                      if name == 'flutter' and any(x[0] == 'android' for x in stack):
-                          found.append((i, tuple(x[0] for x in stack)))
-                      stack.append((name, i))
-                  elif ch == '}' and stack:
-                      stack.pop()
+                      full_start = (max(0, i-240) + m.start(1)) if m else i
+                      if name == 'flutter' and any(parent == 'android' for parent, _, _ in stack):
+                          found.append((full_start, None, tuple(x[0] for x in stack)))
+                      stack.append((name, i, full_start))
+                  elif c == '}' and stack:
+                      name, brace_start, full_start = stack.pop()
+                      if name == 'flutter':
+                          for idx in range(len(found)-1, -1, -1):
+                              if found[idx][0] == full_start and found[idx][1] is None:
+                                  found[idx] = (full_start, i+1, found[idx][2])
+                                  break
                   i += 1
-              # Resolve matching closing braces for each flutter block.
-              result = []
-              for start, parents in found:
-                  depth = 1; j = start + 1; q = None; tri = False; lc = False; bc = False
-                  while j < len(text) and depth:
-                      c = text[j]; two = text[j:j+2]
-                      if lc:
-                          if c == '\n': lc = False
-                          j += 1; continue
-                      if bc:
-                          if two == '*/': bc = False; j += 2
-                          else: j += 1
-                          continue
-                      if q:
-                          if tri:
-                              if text.startswith(q*3, j): q = None; tri = False; j += 3
-                              else: j += 1
-                          else:
-                              if c == '\\': j += 2
-                              elif c == q: q = None; j += 1
-                              else: j += 1
-                          continue
-                      if two == '//': lc = True; j += 2; continue
-                      if two == '/*': bc = True; j += 2; continue
-                      if c in ('"', "'"):
-                          if text.startswith(c*3, j): q = c; tri = True; j += 3
-                          else: q = c; j += 1
-                          continue
-                      if c == '{': depth += 1
-                      elif c == '}': depth -= 1
-                      j += 1
-                  if depth == 0:
-                      result.append((start, j, parents))
-              return result
+              return [x for x in found if x[1] is not None]
 
+          changed, checked, unresolved = [], 0, []
           for root in roots:
-              if not root.exists():
-                  continue
-              for f in root.rglob('*'):
-                  if not f.is_file() or f.suffix not in ('.gradle', '.kts'):
-                      continue
-                  try:
-                      original = f.read_text(encoding='utf-8')
-                  except (UnicodeDecodeError, OSError):
-                      continue
-                  blocks = blocks_with_context(original)
-                  if not blocks:
-                      continue
-                  is_app = f.name in ('build.gradle', 'build.gradle.kts') and f.parent.name == 'app' and f.parent.parent.name == 'android'
+              for f in gradle_files(root):
+                  checked += 1
+                  try: original = f.read_text(encoding='utf-8')
+                  except (UnicodeDecodeError, OSError): continue
+                  blocks = nested_flutter_blocks(original)
+                  if not blocks: continue
+                  is_app_gradle = (f.name in ('build.gradle', 'build.gradle.kts')
+                                   and f.parent.name == 'app' and f.parent.parent.name == 'android'
+                                   and str(f).startswith('project/'))
                   text = original
-                  move = []
-                  for start, end, parents in reversed(blocks):
-                      block = text[start:end]
-                      if is_app:
-                          move.append(block.strip())
-                      text = text[:start] + text[end:]
-                  if move:
-                      text = text.rstrip() + '\n\n' + '\n\n'.join(reversed(move)) + '\n'
+                  moved = []
+                  # Remove from the end so offsets remain valid.
+                  for a, b, parents in sorted(blocks, reverse=True):
+                      block = text[a:b]
+                      if is_app_gradle:
+                          moved.append(block.strip())
+                      # Remove the complete nested block, including its trailing newline.
+                      left = a
+                      while left > 0 and text[left-1] in ' \t': left -= 1
+                      right = b
+                      while right < len(text) and text[right] in ' \t': right += 1
+                      if right < len(text) and text[right] == '\r': right += 1
+                      if right < len(text) and text[right] == '\n': right += 1
+                      text = text[:left] + text[right:]
+                  if moved:
+                      text = text.rstrip() + '\n\n' + '\n\n'.join(reversed(moved)) + '\n'
                   if text != original:
                       f.write_text(text, encoding='utf-8')
                       changed.append(str(f))
 
-          print('Flutter Gradle DSL repair complete.')
+          # Re-scan all reachable Gradle files after edits. Fail early with exact paths
+          # instead of allowing Gradle to fail later with an opaque LibraryExtension error.
+          for root in roots:
+              for f in gradle_files(root):
+                  try: src = f.read_text(encoding='utf-8')
+                  except (UnicodeDecodeError, OSError): continue
+                  if nested_flutter_blocks(src):
+                      unresolved.append(str(f))
+          print(f'Checked {checked} Gradle files across: ' + ', '.join(map(str, roots)))
           if changed:
-              print('Updated files:')
-              for name in changed:
-                  print(' - ' + name)
+              print('Repaired nested flutter blocks:')
+              for name in changed: print(' - ' + name)
           else:
-              print('No nested flutter {} blocks found; source left unchanged.')
+              print('No nested flutter blocks required repair.')
+          if unresolved:
+              print('ERROR: nested flutter {} blocks remain in:')
+              for name in unresolved: print(' - ' + name)
+              raise SystemExit(2)
+          print('Flutter Gradle DSL validation passed.')
           PYGRADLE
 
       - name: Fix Android Config
