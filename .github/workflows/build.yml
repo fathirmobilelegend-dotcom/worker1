@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: "Preflight - install detection utilities"
+      - name: Install Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq unzip jq p7zip-full python3 2>/dev/null || true
@@ -56,51 +56,27 @@ jobs:
 
       - name: Detect Flutter Version
         id: detect
-        shell: bash
         run: |
-          set -euo pipefail
-          rm -rf /tmp/fc && mkdir -p /tmp/fc
-          7z x /tmp/project.zip -o/tmp/fc -y -bso0 -bsp0 >/dev/null 2>&1 || unzip -oq /tmp/project.zip -d /tmp/fc
-          # Prefer the shallowest pubspec so a nested example/plugin cannot override the app.
-          PUB=$(find /tmp/fc -maxdepth 6 -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
-          if [ -z "${PUB:-}" ]; then
-            echo "flutter_version=3.35.2" >> "$GITHUB_OUTPUT"
-            echo "No pubspec found; using current stable fallback 3.35.2"
+          rm -rf /tmp/fc
+          mkdir -p /tmp/fc
+          7z x /tmp/project.zip -o/tmp/fc -y > /dev/null 2>&1 || unzip -o -q /tmp/project.zip -d /tmp/fc 2>/dev/null || true
+          PUB=$(find /tmp/fc -maxdepth 4 -name pubspec.yaml -not -path '*/.*' | head -n1)
+          if [ -z "$PUB" ]; then
+            echo "flutter_version=3.35.2" >> $GITHUB_OUTPUT
             exit 0
           fi
-          echo "Detected pubspec: $PUB"
-          python3 - "$PUB" <<'PYDETECT' >> "$GITHUB_OUTPUT"
-          import re, sys
-          from pathlib import Path
-          pub_path = Path(sys.argv[1])
-          text = pub_path.read_text(encoding='utf-8')
-          m = re.search(r'(?ms)^environment\s*:\s*\n(?:(?:[ \t]+.*)\n)*?[ \t]+sdk\s*:\s*[\"\']?([^\n#]+)', text)
-          constraint = m.group(1).strip().strip('\"\'') if m else ''
-          # Select the oldest stable Flutter release known to include the requested Dart SDK.
-          versions = [(3,4,'3.22.0'), (3,5,'3.24.0'), (3,6,'3.27.0'),
-                      (3,7,'3.29.0'), (3,8,'3.32.0'), (3,9,'3.35.2')]
-          nums = re.findall(r'(?<![0-9])(3)\.(\d+)', constraint)
-          lower = (3, 0)
-          if nums:
-              # >= and caret constraints use the first version as the minimum.
-              lower = (int(nums[0][0]), int(nums[0][1]))
-          chosen = next((v for major, minor, v in versions if (major, minor) >= lower), 'stable' if lower > (3, 9) else '3.35.2')
-
-          # flutter_webrtc 0.12.12 migrated to TextureRegistry.SurfaceProducer.Callback.
-          # That Android embedding API is not present in Flutter 3.22; use Flutter 3.29+
-          # when this plugin is in the app dependency graph.
-          lock_path = pub_path.parent / 'pubspec.lock'
-          lock_text = lock_path.read_text(encoding='utf-8', errors='replace') if lock_path.exists() else ''
-          has_webrtc = bool(re.search(r'(?m)^  flutter_webrtc:\s*$', lock_text)) or bool(re.search(r'(?m)^\s*flutter_webrtc\s*:', text))
-          if has_webrtc and (3, int(chosen.split('.')[1]) if chosen.startswith('3.') else 99) < (3, 29):
-              chosen = '3.29.0'
-          print(f'flutter_version={chosen}')
-          print(f'dart_constraint={constraint or "unspecified"}')
-          print(f'flutter_webrtc_detected={str(has_webrtc).lower()}')
-          if has_webrtc:
-              print('flutter_webrtc_min_flutter=3.29.0')
-          PYDETECT
-          echo "Flutter selected from Dart constraint: $(grep '^flutter_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+          SDK=$(grep -A3 '^environment:' "$PUB" | grep 'sdk:' | head -n1 | sed 's/.*sdk:[[:space:]]*//; s/["'"'"']//g' || echo "")
+          DART=$(echo "$SDK" | grep -oE '[0-9]+\.[0-9]+' | head -n1 || echo "")
+          FV="3.35.2"
+          case "$DART" in
+            "3.8") FV="3.32.0" ;;
+            "3.7") FV="3.29.0" ;;
+            "3.6") FV="3.27.0" ;;
+            "3.5") FV="3.24.0" ;;
+            "3.4") FV="3.22.0" ;;
+          esac
+          echo "flutter_version=$FV" >> $GITHUB_OUTPUT
+          echo "Flutter: $FV"
 
   build:
     name: Build APK
@@ -111,67 +87,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: "[1/8] Install Java 17"
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: "[2/8] Install Android SDK dan Build Tools"
-        shell: bash
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK
         run: |
-          set -Eeuo pipefail
-          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          export ANDROID_SDK_ROOT="$ANDROID_HOME"
-          mkdir -p "$ANDROID_HOME"
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager tidak ditemukan di $ANDROID_HOME/cmdline-tools"
-            exit 1
-          fi
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
-          echo "Menggunakan SDK Manager: $SDKMANAGER"
-          "$SDKMANAGER" --version
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-33" > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;33.0.2" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;34.0.0" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;35.0.0" > /dev/null 2>&1 || true
+          sdkmanager "build-tools;36.0.0" > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" > /dev/null 2>&1 || true
+          sdkmanager "cmdline-tools;latest" > /dev/null 2>&1 || true
 
-          # Terima lisensi secara non-interaktif. Hindari paket preview/emulator
-          # yang tidak diperlukan untuk proses build APK.
-          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null 2>&1 || true
-
-          # Pasang paket satu per satu agar kegagalan paket terlihat jelas.
-          install_sdk_package() {
-            local package="$1"
-            local attempt=1
-            until "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "$package"; do
-              if [ "$attempt" -ge 3 ]; then
-                echo "::error::Gagal memasang Android SDK package: $package"
-                return 1
-              fi
-              echo "Retry instalasi $package (percobaan $((attempt + 1))/3)"
-              sleep $((attempt * 5))
-              attempt=$((attempt + 1))
-            done
-          }
-
-          install_sdk_package "platform-tools"
-          install_sdk_package "platforms;android-36"
-          install_sdk_package "build-tools;36.0.0"
-          install_sdk_package "ndk;27.0.12077973"
-
-          test -x "$ANDROID_HOME/platform-tools/adb"
-          test -d "$ANDROID_HOME/platforms/android-36"
-          test -d "$ANDROID_HOME/build-tools/36.0.0"
-          test -d "$ANDROID_HOME/ndk/27.0.12077973"
-          echo "Android SDK siap digunakan."
-
-      - name: "[3/8] Install build utilities (ZIP, ImageMagick, jq)"
+      - name: Install Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq imagemagick jq unzip curl file zip p7zip-full python3
 
-      - name: "[4/8] Restore Gradle cache"
+      - name: Cache Gradle
         uses: actions/cache@v4
         with:
           path: |
@@ -180,11 +124,11 @@ jobs:
           key: gradle-${{ runner.os }}-${{ github.sha }}
           restore-keys: gradle-${{ runner.os }}-
 
-      - name: "[5/8] Generate signing keystore"
+      - name: Generate Keystore
         run: |
           keytool -genkeypair -v -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass password -keypass password -dname "CN=BuildBot, OU=Dev, O=BuildBot, L=City, S=State, C=ID"
 
-      - name: "[6/8] Reassemble ZIP dan extract source project"
+      - name: Reassemble & Extract Project
         shell: bash
         run: |
           rm -f /tmp/project.zip /tmp/ext
@@ -212,7 +156,7 @@ jobs:
           fi
 
           if [ "${{ needs.preflight.outputs.project_type }}" = "flutter" ]; then
-            PUB=$(find /tmp/ext -maxdepth 6 -type f -name pubspec.yaml -not -path '*/.*' -printf '%d %p\n' | sort -n | head -n1 | cut -d' ' -f2-)
+            PUB=$(find /tmp/ext -maxdepth 4 -name pubspec.yaml -not -path '*/.*' | head -n1)
             if [ -z "$PUB" ]; then echo "pubspec.yaml tidak ditemukan"; ls -la /tmp/ext; exit 1; fi
             SRC=$(dirname "$PUB")
             cp -R "$SRC"/. project/ 2>/dev/null || rsync -a "$SRC"/ project/ 2>/dev/null || true
@@ -233,7 +177,7 @@ jobs:
           echo "Project size: $(du -sh project 2>/dev/null)"
           ls project/ | head -20
 
-      - name: "[7/8] Install Flutter ${{ needs.preflight.outputs.flutter_version }}"
+      - name: Setup Flutter ${{ needs.preflight.outputs.flutter_version }}
         if: needs.preflight.outputs.project_type == 'flutter'
         uses: subosito/flutter-action@v2
         with:
@@ -241,37 +185,9 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Show and verify Flutter/Dart Version
+      - name: Show Flutter Version
         if: needs.preflight.outputs.project_type == 'flutter'
-        shell: bash
-        run: |
-          set -euo pipefail
-          flutter --version
-          dart --version
-          REQUIRED=$(python3 - <<'PYSDK'
-          import re
-          text = open('project/pubspec.yaml', encoding='utf-8').read()
-          match = re.search(r'(?ms)^environment\s*:\s*\n(?:(?:[ \t]+.*)\n)*?[ \t]+sdk\s*:\s*["\']?([^\n#]+)', text)
-          print(match.group(1).strip().strip('"\'') if match else '')
-          PYSDK
-          )
-          echo "Project Dart SDK constraint: ${REQUIRED:-not declared}"
-          DART_VERSION=$(dart --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-          if [ -n "$REQUIRED" ] && [[ "$REQUIRED" =~ \>=[[:space:]]*([0-9]+\.[0-9]+) ]]; then
-            MIN="${BASH_REMATCH[1]}"
-            if ! python3 - "$DART_VERSION" "$MIN" <<'PYVER'
-          import re, sys
-          def parts(value):
-              m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", value)
-              return tuple(int(x or 0) for x in m.groups()) if m else (0, 0, 0)
-          if parts(sys.argv[1]) < parts(sys.argv[2]):
-              print(f"ERROR: Dart {sys.argv[1]} is below required {sys.argv[2]}")
-              raise SystemExit(1)
-          PYVER
-          then
-            exit 1
-          fi
-          fi
+        run: flutter --version
 
       - name: Fix Syntax KTS
         shell: bash
@@ -292,13 +208,12 @@ jobs:
             perl -i -pe "s/^(\s*)versionCode\s+([^\s=\n]+)/\1versionCode = \2/g" "$f" 2>/dev/null
             perl -i -pe "s/^(\s*)versionName\s+([^\s=\n]+)/\1versionName = \2/g" "$f" 2>/dev/null
             perl -i -pe "s/signingConfig\s+signingConfigs\./signingConfig = signingConfigs./g" "$f" 2>/dev/null
-            perl -i -pe "s/jvmTarget\s*=\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?\.toString\(\)/jvmTarget = \"17\"/g" "$f" 2>/dev/null
+            perl -i -pe "s/jvmTarget\s*=\s*JavaVersion\.VERSION_\d+\.toString\(\)/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*JvmTarget\.JVM_\d+/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*\"[^\"]*\"/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f" 2>/dev/null
-            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/sourceCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
-            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/targetCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
-            perl -i -pe "s/JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility = JavaVersion.VERSION_17/g" "$f" 2>/dev/null
           done
           echo "KTS done"
 
@@ -315,227 +230,36 @@ jobs:
             perl -i -pe "s/\btargetSdk\s*=?\s*\d+/targetSdk 36/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*\"[^\"]*\"/jvmTarget = \"17\"/g" "$f" 2>/dev/null
             perl -i -pe "s/jvmTarget\s*=\s*'[^']*'/jvmTarget = \"17\"/g" "$f" 2>/dev/null
-            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/sourceCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
-            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/targetCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
-            perl -i -pe "s/JavaVersion\.VERSION_[0-9]+(_[0-9]+)?/JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/sourceCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/sourceCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
+            perl -i -pe "s/targetCompatibility\s*=?\s*JavaVersion\.VERSION_\d+/targetCompatibility JavaVersion.VERSION_17/g" "$f" 2>/dev/null
           done
           echo "Groovy done"
 
-      - name: Validate Pubspec (non-destructive)
+      - name: Fix Pubspec
         if: needs.preflight.outputs.project_type == 'flutter'
         shell: bash
         run: |
-          set -euo pipefail
           cd project
-          test -f pubspec.yaml || { echo "pubspec.yaml tidak ditemukan di root project"; exit 1; }
-          # Normalize line endings only. Keep the project's SDK constraint and dependency versions intact.
-          sed -i 's/\r$//' pubspec.yaml
-          echo "Pubspec ditemukan; dependency dan SDK constraint dipertahankan."
-
-      - name: Flutter Auto Fix
-        if: needs.preflight.outputs.project_type == 'flutter'
-        shell: bash
-        run: |
-          set -uo pipefail
-          cd project
-          flutter pub get 2>&1 | tee /tmp/flutter-pub-get-prefx.log | tail -60 || true
-          echo "=== Dart formatter ==="
-          dart format --output=write lib test 2>&1 || dart format --output=write lib 2>&1 || true
-          echo "=== Apply supported Dart quick fixes ==="
-          dart fix --apply 2>&1 || true
-          echo "=== Flutter diagnostics ==="
-          flutter analyze --no-pub 2>&1 | tee /tmp/flutter-analyze.log || true
-
-      - name: Repair Flutter Gradle DSL
-        if: needs.preflight.outputs.project_type == 'flutter'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PYGRADLE'
-          from pathlib import Path
-          import os, re
-
-          # Scan only the uploaded project and Pub cache. Never rewrite Flutter SDK internals.
-          # This pass only repairs the uploaded project's nested blocks.
-          # Dependency caches are handled by the targeted constant-repair pass below.
-          roots = [Path('project')]
-
-          def gradle_files(root):
-              try:
-                  for f in root.rglob('*'):
-                      if f.is_file() and (f.name.endswith('.gradle') or f.name.endswith('.gradle.kts')):
-                          yield f
-              except (OSError, PermissionError):
-                  return
-
-          def nested_flutter_blocks(src):
-              # Lex Gradle source, ignoring comments and quoted strings, and retain
-              # the exact ranges of flutter { ... } blocks inside android { ... }.
-              stack, found = [], []
-              i, n = 0, len(src)
-              quote = None; triple = False; line_comment = False; block_comment = False
-              while i < n:
-                  c = src[i]; pair = src[i:i+2]
-                  if line_comment:
-                      if c == '\n': line_comment = False
-                      i += 1; continue
-                  if block_comment:
-                      if pair == '*/': block_comment = False; i += 2
-                      else: i += 1
-                      continue
-                  if quote:
-                      if triple:
-                          if src.startswith(quote * 3, i): quote = None; triple = False; i += 3
-                          else: i += 1
-                      else:
-                          if c == '\\': i += 2
-                          elif c == quote: quote = None; i += 1
-                          else: i += 1
-                      continue
-                  if pair == '//': line_comment = True; i += 2; continue
-                  if pair == '/*': block_comment = True; i += 2; continue
-                  if c in ('\"', "'"):
-                      if src.startswith(c * 3, i): quote = c; triple = True; i += 3
-                      else: quote = c; i += 1
-                      continue
-                  if c == '{':
-                      prefix = src[max(0, i-240):i]
-                      # Match the block label immediately preceding this opening brace.
-                      m = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^{}]*\)\s*)?$', prefix)
-                      name = m.group(1) if m else ''
-                      full_start = (max(0, i-240) + m.start(1)) if m else i
-                      if name == 'flutter' and any(parent == 'android' for parent, _, _ in stack):
-                          found.append((full_start, None, tuple(x[0] for x in stack)))
-                      stack.append((name, i, full_start))
-                  elif c == '}' and stack:
-                      name, brace_start, full_start = stack.pop()
-                      if name == 'flutter':
-                          for idx in range(len(found)-1, -1, -1):
-                              if found[idx][0] == full_start and found[idx][1] is None:
-                                  found[idx] = (full_start, i+1, found[idx][2])
-                                  break
-                  i += 1
-              return [x for x in found if x[1] is not None]
-
-          changed, checked, unresolved = [], 0, []
-          for root in roots:
-              for f in gradle_files(root):
-                  checked += 1
-                  try: original = f.read_text(encoding='utf-8')
-                  except (UnicodeDecodeError, OSError): continue
-                  blocks = nested_flutter_blocks(original)
-                  if not blocks: continue
-                  is_app_gradle = (f.name in ('build.gradle', 'build.gradle.kts')
-                                   and f.parent.name == 'app' and f.parent.parent.name == 'android'
-                                   and str(f).startswith('project/'))
-                  text = original
-                  moved = []
-                  # Remove from the end so offsets remain valid.
-                  for a, b, parents in sorted(blocks, reverse=True):
-                      block = text[a:b]
-                      if is_app_gradle:
-                          moved.append(block.strip())
-                      # Remove the complete nested block, including its trailing newline.
-                      left = a
-                      while left > 0 and text[left-1] in ' \t': left -= 1
-                      right = b
-                      while right < len(text) and text[right] in ' \t': right += 1
-                      if right < len(text) and text[right] == '\r': right += 1
-                      if right < len(text) and text[right] == '\n': right += 1
-                      text = text[:left] + text[right:]
-                  if moved:
-                      text = text.rstrip() + '\n\n' + '\n\n'.join(reversed(moved)) + '\n'
-                  if text != original:
-                      f.write_text(text, encoding='utf-8')
-                      changed.append(str(f))
-
-          # Re-scan all reachable Gradle files after edits. Fail early with exact paths
-          # instead of allowing Gradle to fail later with an opaque LibraryExtension error.
-          for root in roots:
-              for f in gradle_files(root):
-                  try: src = f.read_text(encoding='utf-8')
-                  except (UnicodeDecodeError, OSError): continue
-                  if nested_flutter_blocks(src):
-                      unresolved.append(str(f))
-          print(f'Checked {checked} Gradle files across: ' + ', '.join(map(str, roots)))
-          if changed:
-              print('Repaired nested flutter blocks:')
-              for name in changed: print(' - ' + name)
-          else:
-              print('No nested flutter blocks required repair.')
-          if unresolved:
-              print('ERROR: nested flutter {} blocks remain in:')
-              for name in unresolved: print(' - ' + name)
-              raise SystemExit(2)
-          print('Flutter Gradle DSL validation passed.')
-          PYGRADLE
-
-      - name: Repair Flutter SDK references in Android Library modules
-        if: needs.preflight.outputs.project_type == 'flutter'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PYLIB'
-          from pathlib import Path
-          import os, re
-
-          roots = [Path('project')]
-          cache = Path(os.environ.get('PUB_CACHE') or (Path.home() / '.pub-cache'))
-          if cache.exists(): roots.append(cache)
-          replacements = {
-              'compileSdkVersion': '36',
-              'compileSdk': '36',
-              'minSdkVersion': '21',
-              'minSdk': '21',
-              'targetSdkVersion': '36',
-              'targetSdk': '36',
-              'ndkVersion': '\"27.0.12077973\"',
-          }
-          changed = []
-          scanned = 0
-          for root in roots:
-              if not root.exists(): continue
-              for f in root.rglob('*'):
-                  if not f.is_file() or not (f.name.endswith('.gradle') or f.name.endswith('.gradle.kts')):
-                      continue
-                  # The app module needs the Flutter Gradle plugin extension; preserve it.
-                  normalized = f.as_posix()
-                  if normalized in ('project/android/app/build.gradle', 'project/android/app/build.gradle.kts'):
-                      continue
-                  try: original = f.read_text(encoding='utf-8')
-                  except (UnicodeDecodeError, OSError): continue
-                  scanned += 1
-                  updated = original
-                  for key, value in replacements.items():
-                      updated = re.sub(r'\bflutter\.' + re.escape(key) + r'\b', value, updated)
-                  if updated != original:
-                      f.write_text(updated, encoding='utf-8')
-                      changed.append((f, original, updated))
-          print(f'Scanned {scanned} Gradle files for Flutter SDK constants in Android library/dependency modules.')
-          for f, before, after in changed:
-              print(f'Patched Flutter SDK constants: {f}')
-              for n, line in enumerate(before.splitlines(), 1):
-                  if re.search(r'\bflutter\.(?:compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)\b', line):
-                      print(f'  original line {n}: {line.strip()}')
-          # Verify no SDK constant references remain outside the app module.
-          remaining = []
-          for root in roots:
-              if not root.exists(): continue
-              for f in root.rglob('*'):
-                  if not f.is_file() or not (f.name.endswith('.gradle') or f.name.endswith('.gradle.kts')): continue
-                  normalized = f.as_posix()
-                  if normalized in ('project/android/app/build.gradle', 'project/android/app/build.gradle.kts'): continue
-                  try: content = f.read_text(encoding='utf-8')
-                  except (UnicodeDecodeError, OSError): continue
-                  for n, line in enumerate(content.splitlines(), 1):
-                      if re.search(r'\bflutter\.(?:compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)\b', line):
-                          remaining.append(f'{f}:{n}: {line.strip()}')
-          if remaining:
-              print('ERROR: unresolved Flutter SDK constants:')
-              print('\\n'.join(remaining[:100]))
-              raise SystemExit(3)
-          print('Flutter SDK constant repair validation passed.')
-          PYLIB
+          sed -i -E "s|sdk:[[:space:]]*['\"]?[>=^~ ]*3\.[0-9.]+[^'\"]*['\"]?|sdk: '>=3.6.0 <4.0.0'|g" pubspec.yaml || true
+          sed -i -E "s|webview_flutter:[[:space:]]*[^[:space:]]+|webview_flutter: ^4.13.0|g" pubspec.yaml || true
+          sed -i -E "s|geolocator:[[:space:]]*[^[:space:]]+|geolocator: ^13.0.4|g" pubspec.yaml || true
+          sed -i -E "s|firebase_core:[[:space:]]*[^[:space:]]+|firebase_core: ^2.32.0|g" pubspec.yaml || true
+          sed -i -E "s|firebase_auth:[[:space:]]*[^[:space:]]+|firebase_auth: ^4.19.0|g" pubspec.yaml || true
+          sed -i -E "s|cloud_firestore:[[:space:]]*[^[:space:]]+|cloud_firestore: ^4.17.5|g" pubspec.yaml || true
+          sed -i -E "s|image_picker:[[:space:]]*[^[:space:]]+|image_picker: ^1.1.2|g" pubspec.yaml || true
+          sed -i -E "s|file_picker:[[:space:]]*[^[:space:]]+|file_picker: ^6.2.1|g" pubspec.yaml || true
+          sed -i -E "s|permission_handler:[[:space:]]*[^[:space:]]+|permission_handler: ^11.3.1|g" pubspec.yaml || true
+          sed -i -E "s|flutter_local_notifications:[[:space:]]*[^[:space:]]+|flutter_local_notifications: ^17.2.4|g" pubspec.yaml || true
+          sed -i -E "s|workmanager:[[:space:]]*[^[:space:]]+|workmanager: ^0.5.2|g" pubspec.yaml || true
+          sed -i -E "s|google_maps_flutter:[[:space:]]*[^[:space:]]+|google_maps_flutter: ^2.9.0|g" pubspec.yaml || true
+          sed -i -E "s|dio:[[:space:]]*[^[:space:]]+|dio: ^5.7.0|g" pubspec.yaml || true
+          sed -i -E "s|video_player:[[:space:]]*[^[:space:]]+|video_player: ^2.9.1|g" pubspec.yaml || true
+          sed -i -E "s|sqflite:[[:space:]]*[^[:space:]]+|sqflite: ^2.3.3+1|g" pubspec.yaml || true
+          sed -i -E "s|shared_preferences:[[:space:]]*[^[:space:]]+|shared_preferences: ^2.3.2|g" pubspec.yaml || true
+          sed -i -E "s|url_launcher:[[:space:]]*[^[:space:]]+|url_launcher: ^6.3.1|g" pubspec.yaml || true
+          sed -i -E "s|intl:[[:space:]]*[^[:space:]]+|intl: ^0.19.0|g" pubspec.yaml || true
+          rm -f pubspec.lock
+          echo "Pubspec done"
 
       - name: Fix Android Config
         shell: bash
@@ -581,12 +305,6 @@ jobs:
 
           for f in android/app/build.gradle android/app/build.gradle.kts; do
             [ -f "$f" ] || continue
-            # Match the NDK installed in step [2/8], including projects using flutter.ndkVersion.
-            if [[ "$f" == *.kts ]]; then
-              sed -i -E 's/ndkVersion[[:space:]]*=[[:space:]]*flutter\.ndkVersion/ndkVersion = "27.0.12077973"/g; s/ndkVersion[[:space:]]+flutter\.ndkVersion/ndkVersion = "27.0.12077973"/g' "$f"
-            else
-              sed -i -E 's/ndkVersion[[:space:]]*=?[[:space:]]*flutter\.ndkVersion/ndkVersion "27.0.12077973"/g' "$f"
-            fi
             perl -i -pe 's/storeFile\s*=?\s*file\(".*"\)/storeFile = file("release.keystore")/g' "$f" 2>/dev/null
             perl -i -pe 's/storePassword\s*=?\s*".*"/storePassword = "password"/g' "$f" 2>/dev/null
             perl -i -pe 's/keyAlias\s*=?\s*".*"/keyAlias = "release"/g' "$f" 2>/dev/null
@@ -594,10 +312,10 @@ jobs:
           done
           echo "Android config fixed"
 
-      - name: "[8/8] Resolve dependencies dan compile APK"
+      - name: Build
         shell: bash
         run: |
-          set -uo pipefail
+          set +e
           cd project
           MODE="${{ needs.preflight.outputs.build_type }}"
           PTYPE="${{ needs.preflight.outputs.project_type }}"
@@ -609,12 +327,9 @@ jobs:
           AGP_LIST=("8.11.1" "8.9.1" "8.7.0" "8.3.0")
           KT_LIST=("2.2.20" "2.1.0" "2.0.20" "1.9.0")
 
-          echo "::notice title=Build::Memulai proses build APK"
           for N in $(seq 1 $MAX); do
             i=$((N-1))
-            echo "::group::Percobaan build $N/$MAX"
             echo "===== ATTEMPT $N / $MAX ====="
-            echo "[1/5] Menyiapkan konfigurasi Android Gradle Plugin dan Kotlin"
             AGP="${AGP_LIST[$i]:-8.7.0}"
             KT="${KT_LIST[$i]:-2.0.20}"
 
@@ -653,54 +368,21 @@ jobs:
             done
 
             echo "AGP=$AGP Kotlin=$KT Gradle=$GR"
-            echo "[2/5] Membersihkan cache build sementara"
             rm -rf build .dart_tool/package_config.json 2>/dev/null || true
 
             if [ "$PTYPE" = "flutter" ]; then
-              rm -rf build/app/outputs/flutter-apk
-              echo "[3/5] Mengunduh dan memasang dependency Flutter (flutter pub get)"
-              if ! flutter pub get 2>&1 | tee "/tmp/pub-get-${N}.log" | tail -40; then
-                echo "pub get failed on attempt $N"
-              elif [ "$MODE" = "release" ]; then
-                echo "[4/5] Compile APK mode RELEASE"
-                if flutter build apk --release --no-tree-shake-icons 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -120; then
-                  [ -f "build/app/outputs/flutter-apk/app-release.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
-                fi
-                if grep -Eqi 'flutter_webrtc.*SurfaceProducer\.Callback|SurfaceProducer\.Callback' "/tmp/flutter-build-${N}.log"; then
-                  echo "::error title=Flutter WebRTC compatibility::flutter_webrtc memakai SurfaceProducer.Callback tetapi Flutter SDK yang terpasang belum mendukung API tersebut. Pastikan preflight memilih Flutter 3.29.0 atau lebih baru."
-                  break
-                fi
-                if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
-                  echo "::error title=Flutter Gradle configuration::Gradle masih menemukan referensi Flutter yang tidak tersedia pada Android Library. Lihat stacktrace dan daftar referensi di bawah."
-                  echo "=== Gradle references to Flutter SDK values ==="
-                  grep -RInE --include='*.gradle' --include='*.gradle.kts' 'flutter\.(compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)' . "$HOME/.pub-cache" 2>/dev/null | head -100 || true
-                  echo "=== Gradle stacktrace diagnostic ==="
-                  if [ -x android/gradlew ]; then (cd android && ./gradlew app:assembleRelease --no-daemon --console=plain --stacktrace) 2>&1 | tee /tmp/gradle-library-diagnostic.log | tail -160 || true; fi
-                  break
-                fi
+              flutter pub get 2>&1 | tail -3
+              if [ "$MODE" = "release" ]; then
+                flutter build apk --release --no-tree-shake-icons 2>&1 | tail -60
               else
-                echo "[4/5] Compile APK mode DEBUG"
-                if flutter build apk --debug 2>&1 | tee "/tmp/flutter-build-${N}.log" | tail -120; then
-                  [ -f "build/app/outputs/flutter-apk/app-debug.apk" ] && { echo "SUCCESS attempt $N"; SUCCESS=true; break; }
-                fi
-                if grep -Eqi 'flutter_webrtc.*SurfaceProducer\.Callback|SurfaceProducer\.Callback' "/tmp/flutter-build-${N}.log"; then
-                  echo "::error title=Flutter WebRTC compatibility::flutter_webrtc memakai SurfaceProducer.Callback tetapi Flutter SDK yang terpasang belum mendukung API tersebut. Pastikan preflight memilih Flutter 3.29.0 atau lebih baru."
-                  break
-                fi
-                if grep -Eqi "Could not get unknown property 'flutter'.*LibraryExtension|unknown property 'flutter'.*LibraryExtension" "/tmp/flutter-build-${N}.log"; then
-                  echo "::error title=Flutter Gradle configuration::Gradle masih menemukan referensi Flutter yang tidak tersedia pada Android Library. Lihat stacktrace dan daftar referensi di bawah."
-                  echo "=== Gradle references to Flutter SDK values ==="
-                  grep -RInE --include='*.gradle' --include='*.gradle.kts' 'flutter\.(compileSdkVersion|compileSdk|minSdkVersion|minSdk|targetSdkVersion|targetSdk|ndkVersion)' . "$HOME/.pub-cache" 2>/dev/null | head -100 || true
-                  echo "=== Gradle stacktrace diagnostic ==="
-                  if [ -x android/gradlew ]; then (cd android && ./gradlew app:assembleRelease --no-daemon --console=plain --stacktrace) 2>&1 | tee /tmp/gradle-library-diagnostic.log | tail -160 || true; fi
-                  break
-                fi
+                flutter build apk --debug 2>&1 | tail -60
+              fi
+              if [ -f "build/app/outputs/flutter-apk/app-${MODE}.apk" ] || [ -f "build/app/outputs/flutter-apk/app-release.apk" ] || [ -f "build/app/outputs/flutter-apk/app-debug.apk" ]; then
+                echo "SUCCESS attempt $N"; SUCCESS=true; break
               fi
             else
-              echo "[3/5] Menyiapkan Gradle project dan dependency"
               TASK="assembleRelease"
               [ "$MODE" = "debug" ] && TASK="assembleDebug"
-              echo "[4/5] Menjalankan Gradle task: $TASK"
               if [ -f gradlew ]; then
                 ./gradlew "$TASK" --no-daemon --console=plain --stacktrace 2>&1 | tail -80
               else
@@ -715,8 +397,6 @@ jobs:
               fi
             fi
 
-            echo "::endgroup::"
-            echo "::warning title=Build retry::Percobaan $N gagal; menyiapkan percobaan berikutnya"
             echo "Attempt $N failed"
             flutter clean >/dev/null 2>&1 || true
             rm -rf build .dart_tool 2>/dev/null || true
@@ -730,10 +410,9 @@ jobs:
             done
             exit 1
           fi
-          echo "::notice title=Build selesai::APK berhasil dibuat"
           echo "Build OK"
 
-      - name: "[9/10] Sign APK release"
+      - name: Sign APK
         if: needs.preflight.outputs.build_type == 'release'
         shell: bash
         run: |
@@ -746,7 +425,7 @@ jobs:
           BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
           $ANDROID_HOME/build-tools/$BT/apksigner sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK" 2>/dev/null || true
 
-      - name: "[10/10] Collect APK hasil build"
+      - name: Collect APK
         shell: bash
         run: |
           mkdir -p output
@@ -759,7 +438,7 @@ jobs:
           cp "$APK" output/app-release.apk
           ls -la output/
 
-      - name: "Upload APK artifact"
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-release
